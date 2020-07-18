@@ -1,10 +1,773 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+__author__ = 'stsmith'
+
+# easylist_pac: Convert EasyList Tracker and Adblocking rules to an efficient Proxy Auto Configuration file
+
+# Copyright (C) 2017 by Steven T. Smith <steve dot t dot smith at gmail dot com>, GPL
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import argparse as ap, copy, datetime, functools as fnt, numpy as np, os, re, sys, time, urllib.request, warnings
+
+try:
+    machine_learning_flag = True
+    import multiprocessing as mp, scipy.sparse as sps
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+except ImportError as e:
+    machine_learning_flag = False
+    print(e)
+    warnings.warn("Install scikit-learn for more accurate EasyList rule selection.")
+
+try:
+    plot_flag = True
+    import matplotlib as mpl, matplotlib.pyplot as plt
+    # Legible plot style defaults
+    # http://matplotlib.org/api/matplotlib_configuration_api.html
+    # http://matplotlib.org/users/customizing.html
+    mpl.rcParams['figure.figsize'] = (10.0, 5.0)
+    mpl.rc('font', **{'family': 'sans-serif', 'weight': 'bold', 'size': 14})
+    mpl.rc('axes', **{'titlesize': 20, 'titleweight': 'bold', 'labelsize': 16, 'labelweight': 'bold'})
+    mpl.rc('legend', **{'fontsize': 14})
+    mpl.rc('figure', **{'titlesize': 16, 'titleweight': 'bold'})
+    mpl.rc('lines', **{'linewidth': 2.5, 'markersize': 18, 'markeredgewidth': 0})
+    mpl.rc('mathtext',
+           **{'fontset': 'custom', 'rm': 'sans:bold', 'bf': 'sans:bold', 'it': 'sans:italic', 'sf': 'sans:bold',
+              'default': 'it'})
+    # plt.rc('text',usetex=False) # [default] usetex should be False
+    mpl.rcParams['text.latex.preamble'] = [r'\\usepackage{amsmath,sfmath} \\boldmath']
+except ImportError as e:
+    plot_flag = False
+    print(e)
+    warnings.warn("Install matplotlib to plot rule priorities.")
+
+class EasyListPAC:
+    '''Create a Proxy Auto Configuration file from EasyList rule sets.'''
+
+    def __init__(self):
+        self.parseArgs()
+        self.easylists_download_latest()
+        self.parse_and_filter_rule_files()
+        self.prioritize_rules()
+        if not self.my_extra_rules_off:
+            self.easylist_append_rules(my_extra_rules)
+        if self.debug:
+            print("Good rules and strengths:\n" + '\n'.join('{: 5d}:\t{}\t\t[{:2.1f}]'.format(i,r,s) for (i,(r,s)) in enumerate(zip(self.good_rules,self.good_signal))))
+            print("\nBad rules and strengths:\n" + '\n'.join('{: 5d}:\t{}\t\t[{:2.1f}]'.format(i,r,s) for (i,(r,s)) in enumerate(zip(self.bad_rules,self.bad_signal))))
+            if plot_flag:
+                # plt.plot(np.arange(len(self.good_signal)), self.good_signal, '.')
+                # plt.show()
+                plt.plot(np.arange(len(self.bad_signal)), self.bad_signal, '.')
+                plt.xlabel('Rule index')
+                plt.ylabel('Bad rule distance (logit)')
+                plt.show()
+            return
+        self.parse_easylist_rules()
+        self.create_pac_file()
+
+    def parseArgs(self):
+        # blackhole specification in arguments
+        # best choice is the LAN IP address of the http://hostname/proxy.pac web server or a dedicated blackhole server, e.g. 192.168.0.2:8119
+        parser = ap.ArgumentParser()
+        parser.add_argument('-b', '--blackhole', help="Blackhole IP:port", type=str, default='127.0.0.1:8119')
+        parser.add_argument('-d', '--download-dir', help="Download directory", type=str, default='~/Downloads')
+        parser.add_argument('-g', '--debug', help="Debug: Just print rules", action='store_true')
+        parser.add_argument('-moff', '--my_extra_rules_turnoff_flag', help="Turn off adding my extra rules", default=False, action='store_true')
+        parser.add_argument('-p', '--proxy', help="Proxy host:port", type=str, default='')
+        parser.add_argument('-P', '--PAC-original', help="Original proxy.pac file", type=str, default='proxy.pac.orig')
+        parser.add_argument('-rb', '--bad-rule-max', help="Maximum number of bad rules (-1 for unlimited)", type=int,
+                            default=19999)
+        parser.add_argument('-rg', '--good-rule-max', help="Maximum number of good rules (-1 for unlimited)",
+                            type=int, default=1099)
+        parser.add_argument('-th', '--truncate_hash', help="Truncate hash object length to maximum number", type=int,
+                            default=3999)
+        parser.add_argument('-tr', '--truncate_regex', help="Truncate regex rules to maximum number", type=int,
+                            default=499)
+        parser.add_argument('-w', '--sliding-window', help="Sliding window training and test (slow)", action='store_true')
+        parser.add_argument('-x', '--Extra_EasyList_URLs', help="Extra Easylsit URLs", type=str, nargs='+', default=[])
+        parser.add_argument('-*', '--wildcard-limit', help="Limit the number of wildcards", type=int, default=999)
+        parser.add_argument('-@@', '--exceptions_include_flag', help="Include exception rules", action='store_true')
+        args = parser.parse_args()
+        self.args = parser.parse_args()
+        self.blackhole_ip_port = args.blackhole
+        self.easylist_dir = os.path.expanduser(args.download_dir)
+        self.debug = args.debug
+        self.my_extra_rules_off = args.my_extra_rules_turnoff_flag
+        self.proxy_host_port = args.proxy
+        self.orig_pac_file = os.path.join(self.easylist_dir, args.PAC_original)
+        # n.b. negative limits are set to no limits using [:None] slicing trick
+        self.good_rule_max = args.good_rule_max if args.good_rule_max >= 0 else None
+        self.bad_rule_max = args.bad_rule_max if args.bad_rule_max >= 0 else None
+        self.truncate_hash_max = args.truncate_hash if args.truncate_hash >= 0 else None
+        self.truncate_alternatives_max = args.truncate_regex if args.truncate_regex >= 0 else None
+        self.sliding_window = args.sliding_window
+        self.exceptions_include_flag = args.exceptions_include_flag
+        self.wildcard_named_group_limit = args.wildcard_limit if args.wildcard_limit >= 0 else None
+        self.extra_easylist_urls = args.Extra_EasyList_URLs
+        return self.args
+
+    def easylists_download_latest(self):
+        easylist_url = 'https://easylist.to/easylist/easylist.txt'
+        easyprivacy_url = 'https://easylist.to/easylist/easyprivacy.txt'
+        fanboy_annoyance_url = 'https://easylist.to/easylist/fanboy-annoyance.txt'
+        fanboy_antifacebook = 'https://raw.githubusercontent.com/ryanbr/fanboy-adblock/master/fanboy-antifacebook.txt'
+        self.download_list = [fanboy_antifacebook, fanboy_annoyance_url, easyprivacy_url, easylist_url] + self.extra_easylist_urls
+        self.file_list = []
+        for url in self.download_list:
+            fname = os.path.basename(url)
+            fname_full = os.path.join(self.easylist_dir, fname)
+            file_utc = file_to_utc(fname_full) if os.path.isfile(os.path.join(self.easylist_dir, fname)) else 0.
+            resp = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': user_agent}))
+            url_utc = last_modified_to_utc(last_modified_resp(resp))
+            if (url_utc > file_utc) or (os.path.getsize(fname_full) == 0):  # download the newer file
+                with open(fname_full, mode='w', encoding='utf-8') as out_file:
+                    out_file.write(resp.read().decode('utf-8'))
+            self.file_list.append(fname_full)
+
+    def parse_and_filter_rule_files(self):
+        """Parse all rules into good and bad lists. Use flags to specify included/excluded rules."""
+        self.good_rules = []
+        self.bad_rules = []
+        self.good_opts = []
+        self.bad_opts = []
+        self.good_rules_include_flag = []
+        self.bad_rules_include_flag = []
+        for file in self.file_list:
+            with open(file, 'r', encoding='utf-8') as fd:
+                self.easylist_append_rules(fd)
+
+    def easylist_append_rules(self, fd):
+        """Append EasyList rules from file to good and bad lists."""
+        for line in fd:
+            line = line.rstrip()
+            try:
+                self.easylist_append_one_rule(line)
+            except self.RuleIgnored as e:
+                if self.debug: print(e,flush=True)
+                continue
+
+    class RuleIgnored(Exception):
+        pass
+
+    def easylist_append_one_rule(self, line):
+        """Append EasyList rules from line to good and bad lists."""
+        ignore_rules_flag = False
+        ignored_rules_count = 0
+        line_orig = line
+        # configuration lines and selector rules should already be filtered out
+        if re_test(configuration_re, line) or re_test(selector_re, line): raise self.RuleIgnored("Rule '{}' not added.".format(line))
+        exception_flag = exception_filter(line)  # block default; pass if True
+        line = exception_re.sub(r'\1', line)
+        option_exception_re = not3dimppuposgh_option_exception_re  # ignore these options by default
+        # delete all easylist options **prior** to regex and selector cases
+        # ignore domain limits for now
+        opts = ''  # default: no options in the rule
+        if re_test(option_re, line):
+            opts = option_re.sub(r'\2', line)
+            # domain-specific and other option exceptions: ignore
+            # too many rules (>~ 10k) bog down the browser; make reasonable exclusions here
+            line = option_re.sub(r'\1', line)  # delete all the options and continue
+        # ignore these cases
+        # comment case: ignore
+        if re_test(comment_re, line):
+            if re_test(commentname_sections_ignore_re, line):
+                ignored_rules_comment_start = comment_re.sub('', line)
+                if not ignore_rules_flag:
+                    ignored_rules_count = 0
+                    ignore_rules_flag = True
+                    print('Ignore rules following comment ', end='', flush=True)
+                print('"{}"… '.format(ignored_rules_comment_start), end='', flush=True)
+            else:
+                if ignore_rules_flag: print('\n {:d} rules ignored.'.format(ignored_rules_count), flush=True)
+                ignored_rules_count = 0
+                ignore_rules_flag = False
+            raise self.RuleIgnored("Rule '{}' not added.".format(line))
+        if ignore_rules_flag:
+            ignored_rules_count += 1
+            self.append_rule(exception_flag, line, opts, False)
+            raise self.RuleIgnored("Rule '{}' not added.".format(line))
+        # blank url case: ignore
+        if re_test(httpempty_re, line): raise self.RuleIgnored("Rule '{}' not added.".format(line))
+        # blank line case: ignore
+        if not bool(line): raise self.RuleIgnored("Rule '{}' not added.".format(line))
+        # block default or pass exception
+        if exception_flag:
+            option_exception_re = not3dimppuposgh_option_exception_re  # ignore these options within exceptions
+            if not self.exceptions_include_flag:
+                self.append_rule(exception_flag, line, opts, False)
+                raise self.RuleIgnored("Rule '{}' not added.".format(line))
+        # specific options: ignore
+        if re_test(option_exception_re, opts):
+            self.append_rule(exception_flag, line, opts, False)
+            raise self.RuleIgnored("Rule '{}' not added.".format(line))
+        # add all remaining rules
+        self.append_rule(exception_flag, line, opts, True)
+
+    def append_rule(self,exception_flag,rule, opts, include_rule_flag):
+        if not bool(rule): return  # last chance to reject blank lines -- shouldn't happen
+        if exception_flag:
+            self.good_rules.append(rule)
+            self.good_opts.append(option_tokenizer(opts))
+            self.good_rules_include_flag.append(include_rule_flag)
+        else:
+            self.bad_rules.append(rule)
+            self.bad_opts.append(option_tokenizer(opts))
+            self.bad_rules_include_flag.append(include_rule_flag)
+
+    def good_class_test(self,rule,opts=''):
+        return not bool(badregex_regex_filters_re.search(rule))
+
+    def bad_class_test(self,rule,opts=''):
+        """Bad rule of interest if a match for the bad regex's or specific rule options,
+e.g. non-domain specific popups or images."""
+        return bool(badregex_regex_filters_re.search(rule)) \
+                or (bool(opts) and bool(thrdp_im_pup_os_option_re.search(opts))
+                    and not bool(not3dimppupos_option_exception_re.search(opts)))
+
+    def prioritize_rules(self):
+        # use bootstrap regex preferences
+        # https://github.com/seatgeek/fuzzywuzzy would be great here if there were such a thing for regex
+        self.good_signal = np.array([self.good_class_test(x,opts) for (x,opts,f) in zip(self.good_rules,self.good_opts,self.good_rules_include_flag) if f], dtype=np.int)
+        self.bad_signal = np.array([self.bad_class_test(x,opts) for (x,opts,f) in zip(self.bad_rules,self.bad_opts,self.bad_rules_include_flag) if f], dtype=np.int)
+
+        self.good_columns = np.array([i for (i,f) in enumerate(self.good_rules_include_flag) if f],dtype=int)
+        self.bad_columns = np.array([i for (i,f) in enumerate(self.bad_rules_include_flag) if f],dtype=int)
+
+        # Logistic Regression for more accurate rule priorities
+        if machine_learning_flag:
+            print("Performing logistic regression on rule sets. This will take a few minutes…",end='',flush=True)
+            self.logreg_priorities()
+            print(" done.", flush=True)
+
+            # truncate to positive signal strengths
+            if not self.debug:
+                self.good_rule_max = min(self.good_rule_max,np.count_nonzero(self.good_signal > 0)) \
+                    if isinstance(self.good_rule_max,(int,np.int)) else np.count_nonzero(self.good_signal > 0)
+                self.bad_rule_max = min(self.bad_rule_max, np.count_nonzero(self.bad_signal > 0)) \
+                    if isinstance(self.bad_rule_max,(int,np.int)) else np.count_nonzero(self.bad_signal > 0)
+
+        # prioritize and limit the rules
+        good_pridx = np.array([e[0] for e in sorted(enumerate(self.good_signal),key=lambda e: e[1],reverse=True)],dtype=int)[:self.good_rule_max]
+        self.good_columns = self.good_columns[good_pridx]
+        self.good_signal = self.good_signal[good_pridx]
+        self.good_rules = [self.good_rules[k] for k in self.good_columns]
+        bad_pridx = np.array([e[0] for e in sorted(enumerate(self.bad_signal),key=lambda e: e[1],reverse=True)],dtype=int)[:self.bad_rule_max]
+        self.bad_columns = self.bad_columns[bad_pridx]
+        self.bad_signal = self.bad_signal[bad_pridx]
+        self.bad_rules = [self.bad_rules[k] for k in self.bad_columns]
+
+        # include hardcoded rules
+        for rule in include_these_good_rules:
+            if rule not in self.good_rules: self.good_rules.append(rule)
+        for rule in include_these_bad_rules:
+            if rule not in self.bad_rules: self.bad_rules.append(rule)
+
+        # rules are now ordered
+        self.good_columns = np.arange(0,len(self.good_rules),dtype=self.good_columns.dtype)
+        self.bad_columns = np.arange(0,len(self.bad_rules),dtype=self.bad_columns.dtype)
+
+        return
+
+    def logreg_priorities(self):
+        """Rule prioritization using logistic regression on bootstrap preferences."""
+        self.good_fv_json = {}
+        self.good_column_hash = {}
+        for col, (rule,opts) in enumerate(zip(self.good_rules,self.good_opts)):
+            feature_vector_append_column(rule, opts, col, self.good_fv_json)
+            self.good_column_hash[rule] = col
+        self.bad_fv_json = {}
+        self.bad_column_hash = {}
+        for col, (rule,opts) in enumerate(zip(self.bad_rules,self.bad_opts)):
+            feature_vector_append_column(rule, opts, col, self.bad_fv_json)
+            self.bad_column_hash[rule] = col
+
+        self.good_fv_mat, self.good_row_hash = fv_to_mat(self.good_fv_json, self.good_rules)
+        self.bad_fv_mat, self.bad_row_hash = fv_to_mat(self.bad_fv_json, self.bad_rules)
+
+        self.good_X_all = StandardScaler(with_mean=False).fit_transform(self.good_fv_mat.astype(np.float))
+        self.good_y_all = np.array([self.good_class_test(x,opts) for (x,opts) in zip(self.good_rules, self.good_opts)], dtype=np.int)
+
+        self.bad_X_all = StandardScaler(with_mean=False).fit_transform(self.bad_fv_mat.astype(np.float))
+        self.bad_y_all = np.array([self.bad_class_test(x,opts) for (x,opts) in zip(self.bad_rules, self.bad_opts)], dtype=np.int)
+
+        self.logit_fit_method_sample_weights()
+
+        # inverse regularization signal; smaller values give more sparseness, less model rigidity
+        self.C = 1.e1
+
+        self.logreg_test_in_training()
+        if self.sliding_window: self.logreg_sliding_window()
+
+        return
+
+    def debug_feature_vector(self,rule_substring=r'google.com/pagead'):
+        for j, rule in enumerate(self.bad_rules):
+            if rule.find(rule_substring) >= 0: break
+        col = j
+        print(self.bad_rules[col])
+        _, rows = self.bad_fv_mat[col,:].nonzero()  # fv_mat is transposed
+        print(rows)
+        for row in rows:
+            print('Row {:d}: {}:: {:g}'.format(row, self.bad_row_hash[int(row)], self.bad_fv_mat[col, row]))
+
+    def logit_fit_method_sample_weights(self):
+        # weights for LogisticRegression.fit()
+        self.good_w_all = np.ones(len(self.good_y_all))
+        self.bad_w_all = np.ones(len(self.bad_y_all))
+
+        # add more weight for each of these regex matches
+        for i, rule in enumerate(self.bad_rules):
+            self.bad_w_all[i] += 1/max(1,len(rule))  # slight disadvantage for longer rules
+            for regex in high_weight_regex:
+                self.bad_w_all[i] += len(regex.findall(rule))
+            # these options have more weight
+            self.bad_w_all[i] += bool(thrdp_im_pup_os_option_re.search(self.bad_opts[i]))
+        return
+
+    def logreg_test_in_training(self):
+        """fast, initial method: test vectors in the training data"""
+
+        self.good_fv_logreg = LogisticRegression(C=self.C, penalty='l2', solver='liblinear', tol=0.01)
+        self.bad_fv_logreg = LogisticRegression(C=self.C, penalty='l2', solver='liblinear', tol=0.01)
+
+        good_x_test = self.good_X_all[self.good_columns]
+        good_X = self.good_X_all
+        good_y = self.good_y_all
+        good_w = self.good_w_all
+
+        bad_x_test = self.bad_X_all[self.bad_columns]
+        bad_X = self.bad_X_all
+        bad_y = self.bad_y_all
+        bad_w = self.bad_w_all
+
+        if good_x_test.shape[0] > 0:
+            self.good_fv_logreg.fit(good_X, good_y, sample_weight=good_w)
+            self.good_signal = self.good_fv_logreg.decision_function(good_x_test)
+        if bad_x_test.shape[0] > 0:
+            self.bad_fv_logreg.fit(bad_X, bad_y, sample_weight=bad_w)
+            self.bad_signal = self.bad_fv_logreg.decision_function(bad_x_test)
+        return
+
+    def logreg_sliding_window(self):
+        """bootstrap the signal strengths by removing test vectors from training"""
+
+        # pre-prioritize using test-in-target values and limit the rules
+        if not self.debug:
+            good_preidx = np.array([e[0] for e in sorted(enumerate(self.good_signal),key=lambda e: e[1],reverse=True)],dtype=int)[:int(np.ceil(1.4*self.good_rule_max))]
+            self.good_columns = self.good_columns[good_preidx]
+            bad_preidx = np.array([e[0] for e in sorted(enumerate(self.bad_signal),key=lambda e: e[1],reverse=True)],dtype=int)[:int(np.ceil(1.4*self.bad_rule_max))]
+            self.bad_columns = self.bad_columns[bad_preidx]
+
+        # multithreaded loop for speed
+        use_blocked_not_sklearn_mp = True  # it's a lot faster to block it yourself
+        if use_blocked_not_sklearn_mp:
+            # init w/ target-in-training results
+            good_fv_logreg = copy.deepcopy(self.good_fv_logreg)
+            good_fv_logreg.penalty = 'l2'
+            good_fv_logreg.solver = 'sag'
+            good_fv_logreg.warm_start = True
+            good_fv_logreg.n_jobs = 1  # achieve parallelism via block processing
+            bad_fv_logreg = copy.deepcopy(self.bad_fv_logreg)
+            bad_fv_logreg.penalty = 'l2'
+            bad_fv_logreg.solver = 'sag'
+            bad_fv_logreg.warm_start = True
+            bad_fv_logreg.n_jobs = 1  # achieve parallelism via block processing
+            if False:  # debug mp: turn off multiprocessing with a monkeypatch
+                class NotAMultiProcess(mp.Process):
+                    def start(self): self.run()
+                    def join(self): pass
+                mp.Process = NotAMultiProcess
+
+            # this is probably efficient with Linux's copy-on-write fork(); unsure about BSD/macOS
+            # must refactor to use shared Array() [along with warm_start coeff's] to ensure
+            # see https://stackoverflow.com/questions/5549190/is-shared-readonly-data-copied-to-different-processes-for-python-multiprocessing/
+
+            # distribute training and tests across multiprocessors
+            def training_op(queue, X_all, y_all, w_all, fv_logreg, columns, column_block):
+                """Training and test operation put into a mp.Queue.
+                columns[column_block] and signal[column_block] are the rule columns and corresponding signal strengths
+                """
+                res = np.zeros(len(column_block))
+                for k in range(len(column_block)):
+                    mask = np.zeros(len(y_all), dtype=bool)
+                    mask[columns[column_block[k]]] = True
+                    mask = np.logical_not(mask)
+
+                    x_test = X_all[np.logical_not(mask)]
+                    X = X_all[mask]
+                    y = y_all[mask]
+                    w = w_all[mask]
+
+                    fv_logreg.fit(X, y, sample_weight=w)
+                    res[k] = fv_logreg.decision_function(x_test)[0]
+                queue.put((column_block,res))  # signal[column_block] = res
+                return
+
+            num_threads = mp.cpu_count()
+
+            # good
+            q = mp.Queue()
+            jobs = []
+            self.good_signal = np.zeros(len(self.good_columns))
+            block_length = len(self.good_columns) // num_threads
+            column_block = np.arange(0, block_length)
+            while len(column_block) > 0:
+                column_block = column_block[np.where(column_block < len(self.good_columns))]
+                fv_logreg = copy.deepcopy(good_fv_logreg)  # each process gets its own .coeff_'s
+                column_block_copy = np.copy(column_block)  # each process gets its own block of columns
+                p = mp.Process(target=training_op, args=(q, self.good_X_all, self.good_y_all, self.good_w_all, fv_logreg, self.good_columns, column_block_copy))
+                p.start()
+                jobs.append(p)
+                column_block += len(column_block)
+            # process the results in the queue
+            for i in range(len(jobs)):
+                column_block, res = q.get()
+                self.good_signal[column_block] = res
+            # join all jobs and wait for them to complete
+            for p in jobs: p.join()
+
+            # bad
+            q = mp.Queue()
+            jobs = []
+            self.bad_signal = np.zeros(len(self.bad_columns))
+            block_length = len(self.bad_columns) // num_threads
+            column_block = np.arange(0, block_length)
+            while len(column_block) > 0:
+                column_block = column_block[np.where(column_block < len(self.bad_columns))]
+                fv_logreg = copy.deepcopy(bad_fv_logreg)   # each process gets its own .coeff_'s
+                column_block_copy = np.copy(column_block)  # each process gets its own block of columns
+                p = mp.Process(target=training_op, args=(q, self.bad_X_all, self.bad_y_all, self.bad_w_all, fv_logreg, self.bad_columns, column_block_copy))
+                p.start()
+                jobs.append(p)
+                column_block += len(column_block)
+            # process the results in the queue
+            for i in range(len(jobs)):
+                column_block, res = q.get()
+                self.bad_signal[column_block] = res
+            # join all jobs and wait for them to complete
+            for p in jobs: p.join()
+        else:  # if use_blocked_not_sklearn_mp:
+            def training_op(X_all, y_all, w_all, fv_logreg, columns, signal):
+                """Training and test operations reusing results with multiprocessing."""
+                res = np.zeros(len(signal))
+                for k in range(len(res)):
+                    mask = np.zeros(len(y_all), dtype=bool)
+                    mask[columns[k]] = True
+                    mask = np.logical_not(mask)
+
+                    x_test = X_all[np.logical_not(mask)]
+                    X = X_all[mask]
+                    y = y_all[mask]
+                    w = w_all[mask]
+
+                    fv_logreg.fit(X, y, sample_weight=w)
+                    res[k] = fv_logreg.decision_function(x_test)[0]
+                signal[:] = res
+                return
+            # good
+            training_op(self.good_X_all, self.good_y_all, self.good_w_all, self.good_fv_logreg, self.good_columns, self.good_signal)
+            # bad
+            training_op(self.bad_X_all, self.bad_y_all, self.bad_w_all, self.bad_fv_logreg, self.bad_columns, self.bad_signal)
+        return
+
+    def parse_easylist_rules(self):
+        for rule in self.good_rules: self.easylist_to_javascript_vars(rule)
+        for rule in self.bad_rules: self.easylist_to_javascript_vars(rule)
+        ordered_unique_all_js_var_lists()
+        return
+
+    def easylist_to_javascript_vars(self,rule,ignore_huge_url_regex_rule_list=False):
+        rule = rule.rstrip()
+        rule_orig = rule
+        exception_flag = exception_filter(rule)  # block default; pass if True
+        rule = exception_re.sub(r'\1', rule)
+        option_exception_re = not3dimppuposgh_option_exception_re  # ignore these options by default
+        opts = ''  # default: no options in the rule
+        if re_test(option_re, rule):
+            opts = option_re.sub(r'\2', rule)
+            # domain-specific and other option exceptions: ignore
+            # too many rules (>~ 10k) bog down the browser; make reasonable exclusions here
+            rule = option_re.sub(r'\1', rule)  # delete all the options and continue
+        # ignore these cases
+        # comment case: ignore
+        if re_test(comment_re, rule): return
+        # block default or pass exception
+        if exception_flag:
+            option_exception_re = not3dimppuposgh_option_exception_re  # ignore these options within exceptions
+            if not self.exceptions_include_flag: return
+        # specific options: ignore
+        if re_test(option_exception_re, opts): return
+        # blank url case: ignore
+        if re_test(httpempty_re, rule): return
+        # blank line case: ignore
+        if not rule: return
+        # treat each of the these cases separately, here and in Javascript
+        # regex case
+        if re_test(regex_re, rule):
+            if regex_ignore_test(rule): return
+            rule = regex_re.sub(r'\1', rule)
+            if exception_flag:
+                good_url_regex.append(rule)
+            else:
+                if not re_test(badregex_regex_filters_re,
+                               rule): return  # limit bad regex's to those in the filter
+                bad_url_regex.append(rule)
+            return
+        # now that regex's are handled, delete unnecessary wildcards, e.g. /.../*
+        rule = wildcard_begend_re.sub(r'\1', rule)
+        # domain anchors, || or '|http://a.b' -> domain anchor 'a.b' for regex efficiency in JS
+        if re_test(domain_anch_re, rule) or re_test(scheme_anchor_re, rule):
+            # strip off initial || or |scheme://
+            if re_test(domain_anch_re, rule):
+                rule = domain_anch_re.sub(r'\1', rule)
+            elif re_test(scheme_anchor_re, rule):
+                rule = scheme_anchor_re.sub("", rule)
+            # host subcase
+            if re_test(da_hostonly_re, rule):
+                rule = da_hostonly_re.sub(r'\1', rule)
+                if not re_test(wild_anch_sep_exc_re, rule):  # exact subsubcase
+                    if not re_test(badregex_regex_filters_re, rule):
+                        return  # limit bad regex's to those in the filter
+                    if exception_flag:
+                        good_da_host_exact.append(rule)
+                    else:
+                        bad_da_host_exact.append(rule)
+                    return
+                else:  # regex subsubcase
+                    if regex_ignore_test(rule): return
+                    if exception_flag:
+                        good_da_host_regex.append(rule)
+                    else:
+                        if not re_test(badregex_regex_filters_re,
+                                       rule): return  # limit bad regex's to those in the filter
+                        bad_da_host_regex.append(rule)
+                    return
+            # hostpath subcase
+            if re_test(da_hostpath_re, rule):
+                rule = da_hostpath_re.sub(r'\1', rule)
+                if not re_test(wild_sep_exc_noanch_re, rule) and re_test(pathend_re, rule):  # exact subsubcase
+                    rule = re.sub(r'\|$', '', rule)  # strip EOL anchors
+                    if not re_test(badregex_regex_filters_re, rule):
+                        return  # limit bad regex's to those in the filter
+                    if exception_flag:
+                        good_da_hostpath_exact.append(rule)
+                    else:
+                        bad_da_hostpath_exact.append(rule)
+                    return
+                else:  # regex subsubcase
+                    if regex_ignore_test(rule): return
+                    # ignore option rules for some regex rules
+                    if re_test(alloption_exception_re, opts): return
+                    if exception_flag:
+                        good_da_hostpath_regex.append(rule)
+                    else:
+                        if not re_test(badregex_regex_filters_re,
+                                       rule): return  # limit bad regex's to those in the filter
+                        bad_da_hostpath_regex.append(rule)
+                    return
+            # hostpathquery default case
+            if True:
+                # if re_test(re.compile(r'^go\.'),rule):
+                #     pass
+                if regex_ignore_test(rule): return
+                if exception_flag:
+                    good_da_regex.append(rule)
+                else:
+                    bad_da_regex.append(rule)
+                return
+        # all other non-regex patterns
+        if True:
+            if regex_ignore_test(rule): return
+            if not ignore_huge_url_regex_rule_list:
+                if re_test(alloption_exception_re, opts): return
+                if exception_flag:
+                    good_url_parts.append(rule)
+                else:
+                    if not re_test(badregex_regex_filters_re,
+                                   rule): return  # limit bad regex's to those in the filter
+                    bad_url_parts.append(rule)
+                return  # superfluous return
+
+    def create_pac_file(self):
+        self.proxy_pac_init()
+        self.proxy_pac = self.proxy_pac_preamble \
+                    + "\n".join(["// " + l for l in self.easylist_strategy.split("\n")]) \
+                    + self.js_init_object('good_da_host_exact') \
+                    + self.js_init_regexp('good_da_host_regex', True) \
+                    + self.js_init_object('good_da_hostpath_exact') \
+                    + self.js_init_regexp('good_da_hostpath_regex', True) \
+                    + self.js_init_regexp('good_da_regex', True) \
+                    + self.js_init_object('good_da_host_exceptions_exact') \
+                    + self.js_init_object('bad_da_host_exact') \
+                    + self.js_init_regexp('bad_da_host_regex', True) \
+                    + self.js_init_object('bad_da_hostpath_exact') \
+                    + self.js_init_regexp('bad_da_hostpath_regex', True) \
+                    + self.js_init_regexp('bad_da_regex', True) \
+                    + self.js_init_regexp('good_url_parts') \
+                    + self.js_init_regexp('bad_url_parts') \
+                    + self.js_init_regexp('good_url_regex') \
+                    + self.js_init_regexp('bad_url_regex') \
+                    + self.proxy_pac_postamble
+
+        for l in ['good_da_host_exact',
+                  'good_da_host_regex',
+                  'good_da_hostpath_exact',
+                  'good_da_hostpath_regex',
+                  'good_da_regex',
+                  'good_da_host_exceptions_exact',
+                  'bad_da_host_exact',
+                  'bad_da_host_regex',
+                  'bad_da_hostpath_exact',
+                  'bad_da_hostpath_regex',
+                  'bad_da_regex',
+                  'good_url_parts',
+                  'bad_url_parts',
+                  'good_url_regex',
+                  'bad_url_regex']:
+            print("{}: {:d} rules".format(l, len(globals()[l])), flush=True)
+
+        with open(os.path.join(self.easylist_dir, 'proxy.pac'), 'w', encoding='utf-8') as fd:
+            fd.write(self.proxy_pac)
+
+    def proxy_pac_init(self):
+        self.pac_proxy = 'PROXY {}'.format(self.proxy_host_port) if self.proxy_host_port else 'DIRECT'
+
+        # define a default, user-supplied FindProxyForURL function
+        self.default_FindProxyForURL_function = '''\
+function FindProxyForURL(url, host)
+{
+if (
+   isPlainHostName(host) ||
+   shExpMatch(host, "10.*") ||
+   shExpMatch(host, "172.16.*") ||
+   shExpMatch(host, "192.168.*") ||
+   shExpMatch(host, "127.*") ||
+   dnsDomainIs(host, ".local") || dnsDomainIs(host, ".LOCAL")
+)
+        return "DIRECT";
+else if (
+   /*
+       Proxy bypass hostnames
+   */
+   /*
+       Fix iOS 13 PAC file issue with Mail.app
+       See: https://forums.developer.apple.com/thread/121928
+   */
+   // Apple
+   (host == "imap.mail.me.com") || (host == "smtp.mail.me.com") ||
+   dnsDomainIs(host, "imap.mail.me.com") || dnsDomainIs(host, "smtp.mail.me.com") ||
+   (host == "p03-imap.mail.me.com") || (host == "p03-smtp.mail.me.com") ||
+   dnsDomainIs(host, "p03-imap.mail.me.com") || dnsDomainIs(host, "p03-smtp.mail.me.com") ||
+   (host == "p66-imap.mail.me.com") || (host == "p66-smtp.mail.me.com") ||
+   dnsDomainIs(host, "p66-imap.mail.me.com") || dnsDomainIs(host, "p66-smtp.mail.me.com") ||
+   // Google
+   (host == "imap.gmail.com") || (host == "smtp.gmail.com") ||
+   dnsDomainIs(host, "imap.gmail.com") || dnsDomainIs(host, "smtp.gmail.com") ||
+   // Yahoo
+   (host == "imap.mail.yahoo.com") || (host == "smtp.mail.yahoo.com") ||
+   dnsDomainIs(host, "imap.mail.yahoo.com") || dnsDomainIs(host, "smtp.mail.yahoo.com") ||
+   // Comcast
+   (host == "imap.comcast.net") || (host == "smtp.comcast.net") ||
+   dnsDomainIs(host, "imap.comcast.net") || dnsDomainIs(host, "smtp.comcast.net") ||
+   // Apple Enterprise Network Domains; https://support.apple.com/en-us/HT210060
+   (host == "albert.apple.com") || dnsDomainIs(host, "albert.apple.com") ||
+   (host == "captive.apple.com") || dnsDomainIs(host, "captive.apple.com") ||
+   (host == "gs.apple.com") || dnsDomainIs(host, "gs.apple.com") ||
+   (host == "humb.apple.com") || dnsDomainIs(host, "humb.apple.com") ||
+   (host == "static.ips.apple.com") || dnsDomainIs(host, "static.ips.apple.com") ||
+   (host == "tbsc.apple.com") || dnsDomainIs(host, "tbsc.apple.com") ||
+   (host == "time-ios.apple.com") || dnsDomainIs(host, "time-ios.apple.com") ||
+   (host == "time.apple.com") || dnsDomainIs(host, "time.apple.com") ||
+   (host == "time-macos.apple.com") || dnsDomainIs(host, "time-macos.apple.com") ||
+   dnsDomainIs(host, ".push.apple.com") ||
+   (host == "gdmf.apple.com") || dnsDomainIs(host, "gdmf.apple.com") ||
+   (host == "deviceenrollment.apple.com") || dnsDomainIs(host, "deviceenrollment.apple.com") ||
+   (host == "deviceservices-external.apple.com") || dnsDomainIs(host, "deviceservices-external.apple.com") ||
+   (host == "identity.apple.com") || dnsDomainIs(host, "identity.apple.com") ||
+   (host == "iprofiles.apple.com") || dnsDomainIs(host, "iprofiles.apple.com") ||
+   (host == "mdmenrollment.apple.com") || dnsDomainIs(host, "mdmenrollment.apple.com") ||
+   (host == "setup.icloud.com") || dnsDomainIs(host, "setup.icloud.com") ||
+   (host == "appldnld.apple.com") || dnsDomainIs(host, "appldnld.apple.com") ||
+   (host == "gg.apple.com") || dnsDomainIs(host, "gg.apple.com") ||
+   (host == "gnf-mdn.apple.com") || dnsDomainIs(host, "gnf-mdn.apple.com") ||
+   (host == "gnf-mr.apple.com") || dnsDomainIs(host, "gnf-mr.apple.com") ||
+   (host == "gs.apple.com") || dnsDomainIs(host, "gs.apple.com") ||
+   (host == "ig.apple.com") || dnsDomainIs(host, "ig.apple.com") ||
+   (host == "mesu.apple.com") || dnsDomainIs(host, "mesu.apple.com") ||
+   (host == "oscdn.apple.com") || dnsDomainIs(host, "oscdn.apple.com") ||
+   (host == "osrecovery.apple.com") || dnsDomainIs(host, "osrecovery.apple.com") ||
+   (host == "skl.apple.com") || dnsDomainIs(host, "skl.apple.com") ||
+   (host == "swcdn.apple.com") || dnsDomainIs(host, "swcdn.apple.com") ||
+   (host == "swdist.apple.com") || dnsDomainIs(host, "swdist.apple.com") ||
+   (host == "swdownload.apple.com") || dnsDomainIs(host, "swdownload.apple.com") ||
+   (host == "swpost.apple.com") || dnsDomainIs(host, "swpost.apple.com") ||
+   (host == "swscan.apple.com") || dnsDomainIs(host, "swscan.apple.com") ||
+   (host == "updates-http.cdn-apple.com") || dnsDomainIs(host, "updates-http.cdn-apple.com") ||
+   (host == "updates.cdn-apple.com") || dnsDomainIs(host, "updates.cdn-apple.com") ||
+   (host == "xp.apple.com") || dnsDomainIs(host, "xp.apple.com") ||
+   dnsDomainIs(host, ".itunes.apple.com") ||
+   dnsDomainIs(host, ".apps.apple.com") ||
+   dnsDomainIs(host, ".mzstatic.com") ||
+   (host == "ppq.apple.com") || dnsDomainIs(host, "ppq.apple.com") ||
+   (host == "lcdn-registration.apple.com") || dnsDomainIs(host, "lcdn-registration.apple.com") ||
+   (host == "crl.apple.com") || dnsDomainIs(host, "crl.apple.com") ||
+   (host == "crl.entrust.net") || dnsDomainIs(host, "crl.entrust.net") ||
+   (host == "crl3.digicert.com") || dnsDomainIs(host, "crl3.digicert.com") ||
+   (host == "crl4.digicert.com") || dnsDomainIs(host, "crl4.digicert.com") ||
+   (host == "ocsp.apple.com") || dnsDomainIs(host, "ocsp.apple.com") ||
+   (host == "ocsp.digicert.com") || dnsDomainIs(host, "ocsp.digicert.com") ||
+   (host == "ocsp.entrust.net") || dnsDomainIs(host, "ocsp.entrust.net") ||
+   (host == "ocsp.verisign.net") || dnsDomainIs(host, "ocsp.verisign.net") ||
+   // Zoom
+   dnsDomainIs(host, ".zoom.us")
+)
+        return "PROXY localhost:3128";
+else
+        return "PROXY localhost:3128";
+}
+'''
+
+        if os.path.isfile(self.orig_pac_file):
+            with open(self.orig_pac_file, 'r', encoding='utf-8') as fd:
+                self.original_FindProxyForURL_function = fd.read()
+        else:
+            self.original_FindProxyForURL_function = self.default_FindProxyForURL_function
+
+        # change last 'return "PROXY ..."' to 'return EasyListFindProxyForURL(url, host)'
+        def re_sub_last(pattern, repl, string, **kwargs): 
+            '''re.sub on the last match in a string'''
+            # ensure that pattern is grouped
+            # (note that (?:) is not caught)
+            pattern_grouped = pattern if bool(re.match(r'\(.+\)',pattern)) else r'({})'.format(pattern)
+            spl = re.split(pattern_grouped, string, **kwargs) 
+            if len(spl) == 1: return string 
+            spl[-2] = re.sub(pattern, repl, spl[-2], **kwargs)
+            return ''.join(spl)
+        self.original_FindProxyForURL_function = re_sub_last(r'return[\s]+"PROXY[^"]+"', 'return EasyListFindProxyForURL(url, host)',
+                                               self.original_FindProxyForURL_function)
+
+        #  proxy.pac preamble
+        self.calling_command = ' '.join([os.path.basename(sys.argv[0])] + sys.argv[1:])
+        self.proxy_pac_preamble = '''\
 // PAC (Proxy Auto Configuration) Filter from EasyList rules
 // 
 // Copyright (C) 2017 by Steven T. Smith <steve dot t dot smith at gmail dot com>, GPL
 // https://github.com/essandess/easylist-pac-privoxy/
 //
-// PAC file created on Sat, 18 Jul 2020 22:57:44 GMT
-// Created with command: easylist_pac.py
+// PAC file created on {}
+// Created with command: {}
 //
 // http://www.gnu.org/licenses/lgpl.txt
 //
@@ -31,10 +794,10 @@
 // Define the blackhole proxy for blocked adware and trackware
 
 var normal = "DIRECT";
-var proxy = "DIRECT";                  // e.g. 127.0.0.1:3128
+var proxy = "{}";                  // e.g. 127.0.0.1:3128
 // var blackhole_ip_port = "127.0.0.1:8119";  // ngnix-hosted blackhole
 // var blackhole_ip_port = "8.8.8.8:53";      // GOOG DNS blackhole; do not use: no longer works with iOS 11—causes long waits on some sites
-var blackhole_ip_port = "127.0.0.1:8119";    // on iOS a working blackhole requires return code 200;
+var blackhole_ip_port = "{}";    // on iOS a working blackhole requires return code 200;
 // e.g. use the adblock2privoxy nginx server as a blackhole
 var blackhole = "PROXY " + blackhole_ip_port;
 
@@ -51,2820 +814,9 @@ var blackhole = "PROXY " + blackhole_ip_port;
 
 // Too many rules (>~ 10k) bog down the browser; make reasonable exclusions here:
 
-// EasyList rules:
-// https://adblockplus.org/filters
-// https://adblockplus.org/filter-cheatsheet
-// https://opnsrce.github.io/javascript-performance-tip-precompile-your-regular-expressions
-// https://adblockplus.org/blog/investigating-filter-matching-algorithms
-// 
-// Strategies to convert EasyList rules to Javascript tests:
-// 
-// In general:
-// 1. Preference for performance over 1:1 EasyList functionality
-// 2. Limit number of rules to ~O(10k) to avoid computational burden on mobile devices
-// 3. Exact matches: use Object hashing (very fast); use efficient NFA RegExp's for all else
-// 4. Divide and conquer specific cases to avoid large RegExp's
-// 5. Based on testing code performance on an iPhone: mobile Safari, Chrome with System Activity Monitor.app
-// 6. Backstop these proxy.pac rules with Privoxy rules and a browser plugin
-// 
-// scheme://host/path?query ; FindProxyForURL(url, host) has full url and host strings
-// 
-// EasyList rules:
-// 
-// || domain anchor
-// 
-// ||host is exact e.g. ||a.b^ ? then hasOwnProperty(hash,host)
-// ||host is wildcard e.g. ||a.* ? then RegExp.test(host)
-// 
-// ||host/path is exact e.g. ||a.b/c? ? then hasOwnProperty(hash,url_path_noquery) [strip ?'s]
-// ||host/path is wildcard e.g. ||a.*/c? ? then RegExp.test(url_path_noquery) [strip ?'s]
-// 
-// ||host/path?query is exact e.g. ||a.b/c?d= ? assume none [handle small number within RegExp's]
-// ||host/path?query is wildcard e.g. ||a.*/c?d= ? then RegExp.test(url)
-// 
-// url parts e.g. a.b^c&d|
-// 
-// All cases RegExp.test(url)
-// Except: |http://a.b. Treat these as domain anchors after stripping the scheme
-// 
-// regex e.g. /r/
-// 
-// All cases RegExp.test(url)
-// 
-// @@ exceptions
-// 
-// Flag as "good" versus "bad" default
-// 
-// Variable name conventions (example that defines the rule):
-// 
-// bad_da_host_exact == bad domain anchor with host/path type, exact matching with Object hash
-// bad_da_host_regex == bad domain anchor with host/path type, RegExp matching
-// 
-// 110 rules:
-var good_da_host_JSON = { "apple.com": null,
-"albert.apple.com": null,
-"captive.apple.com": null,
-"gs.apple.com": null,
-"humb.apple.com": null,
-"static.ips.apple.com": null,
-"tbsc.apple.com": null,
-"time-ios.apple.com": null,
-"time.apple.com": null,
-"time-macos.apple.com": null,
-"gdmf.apple.com": null,
-"deviceenrollment.apple.com": null,
-"deviceservices-external.apple.com": null,
-"identity.apple.com": null,
-"iprofiles.apple.com": null,
-"mdmenrollment.apple.com": null,
-"setup.icloud.com": null,
-"appldnld.apple.com": null,
-"gg.apple.com": null,
-"gnf-mdn.apple.com": null,
-"gnf-mr.apple.com": null,
-"ig.apple.com": null,
-"mesu.apple.com": null,
-"oscdn.apple.com": null,
-"osrecovery.apple.com": null,
-"skl.apple.com": null,
-"swcdn.apple.com": null,
-"swdist.apple.com": null,
-"swdownload.apple.com": null,
-"swpost.apple.com": null,
-"swscan.apple.com": null,
-"updates-http.cdn-apple.com": null,
-"updates.cdn-apple.com": null,
-"xp.apple.com": null,
-"ppq.apple.com": null,
-"lcdn-registration.apple.com": null,
-"crl.apple.com": null,
-"crl.entrust.net": null,
-"crl3.digicert.com": null,
-"crl4.digicert.com": null,
-"ocsp.apple.com": null,
-"ocsp.digicert.com": null,
-"ocsp.entrust.net": null,
-"ocsp.verisign.net": null,
-"icloud.com": null,
-"apple-dns.net": null,
-"init.itunes.apple.com": null,
-"init-cdn.itunes-apple.com.akadns.net": null,
-"itunes.apple.com.edgekey.net": null,
-"p32-escrowproxy.icloud.com": null,
-"p32-escrowproxy.fe.apple-dns.net": null,
-"keyvalueservice.icloud.com": null,
-"keyvalueservice.fe.apple-dns.net": null,
-"p32-bookmarks.icloud.com": null,
-"p32-bookmarks.fe.apple-dns.net": null,
-"p32-ckdatabase.icloud.com": null,
-"p32-ckdatabase.fe.apple-dns.net": null,
-"configuration.apple.com": null,
-"configuration.apple.com.edgekey.net": null,
-"mesu-cdn.apple.com.akadns.net": null,
-"mesu.g.aaplimg.com": null,
-"gspe1-ssl.ls.apple.com": null,
-"gspe1-ssl.ls.apple.com.edgekey.net": null,
-"api-glb-bos.smoot.apple.com": null,
-"query.ess.apple.com": null,
-"query-geo.ess-apple.com.akadns.net": null,
-"query.ess-apple.com.akadns.net": null,
-"setup.fe.apple-dns.net": null,
-"gsa.apple.com": null,
-"gsa.apple.com.akadns.net": null,
-"icloud-content.com": null,
-"usbos-edge.icloud-content.com": null,
-"usbos.ce.apple-dns.net": null,
-"lcdn-locator.apple.com": null,
-"lcdn-locator.apple.com.akadns.net": null,
-"lcdn-locator-usuqo.apple.com.akadns.net": null,
-"cl1.apple.com": null,
-"cl2.apple.com": null,
-"cl3.apple.com": null,
-"cl4.apple.com": null,
-"cl5.apple.com": null,
-"cl1-cdn.origin-apple.com.akadns.net": null,
-"cl2-cdn.origin-apple.com.akadns.net": null,
-"cl3-cdn.origin-apple.com.akadns.net": null,
-"cl4-cdn.origin-apple.com.akadns.net": null,
-"cl5-cdn.origin-apple.com.akadns.net": null,
-"cl1.apple.com.edgekey.net": null,
-"cl2.apple.com.edgekey.net": null,
-"cl3.apple.com.edgekey.net": null,
-"cl4.apple.com.edgekey.net": null,
-"cl5.apple.com.edgekey.net": null,
-"xp.itunes-apple.com.akadns.net": null,
-"mt-ingestion-service-pv.itunes.apple.com": null,
-"p32-sharedstreams.icloud.com": null,
-"p32-sharedstreams.fe.apple-dns.net": null,
-"p32-fmip.icloud.com": null,
-"p32-fmip.fe.apple-dns.net": null,
-"gsp-ssl.ls.apple.com": null,
-"gsp-ssl.ls-apple.com.akadns.net": null,
-"gsp-ssl.ls2-apple.com.akadns.net": null,
-"gspe35-ssl.ls.apple.com": null,
-"gspe35-ssl.ls-apple.com.akadns.net": null,
-"gspe35-ssl.ls.apple.com.edgekey.net": null,
-"gsp64-ssl.ls.apple.com": null,
-"gsp64-ssl.ls-apple.com.akadns.net": null,
-"mt-ingestion-service-st11.itunes.apple.com": null,
-"mt-ingestion-service-st11.itunes-apple.com.akadns.net": null,
-"microsoft.com": null,
-"mozilla.com": null,
-"mozilla.org": null };
-var good_da_host_exact_flag = 110 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 4 rules as an efficient NFA RegExp:
-var good_da_host_RegExp = /^(?:[\w-]+\.)*?(?:^(?:[\w-]+\.)*?push\.apple\.com[^\w.%-]|^(?:[\w-]+\.)*?itunes\.apple\.com[^\w.%-]|^(?:[\w-]+\.)*?apps\.apple\.com[^\w.%-]|^(?:[\w-]+\.)*?mzstatic\.com[^\w.%-])/i;
-var good_da_host_regex_flag = 4 > 0 ? true : false;  // test for non-zero number of rules
+'''.format(time.strftime("%a, %d %b %Y %X GMT", time.gmtime()),self.calling_command,self.pac_proxy,self.blackhole_ip_port)
 
-// 0 rules:
-var good_da_hostpath_JSON = {  };
-var good_da_hostpath_exact_flag = 0 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 0 rules as an efficient NFA RegExp:
-var good_da_hostpath_RegExp = /^$/;
-var good_da_hostpath_regex_flag = 0 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 0 rules as an efficient NFA RegExp:
-var good_da_RegExp = /^$/;
-var good_da_regex_flag = 0 > 0 ? true : false;  // test for non-zero number of rules
-
-// 39 rules:
-var good_da_host_exceptions_JSON = { "iad.apple.com": null,
-"iadsdk.apple.com": null,
-"iadsdk.apple.com.edgekey.net": null,
-"bingads.microsoft.com": null,
-"azure.bingads.trafficmanager.net": null,
-"choice.microsoft.com": null,
-"choice.microsoft.com.nsatc.net": null,
-"corpext.msitadfs.glbdns2.microsoft.com": null,
-"corp.sts.microsoft.com": null,
-"df.telemetry.microsoft.com": null,
-"diagnostics.support.microsoft.com": null,
-"feedback.search.microsoft.com": null,
-"i1.services.social.microsoft.com": null,
-"i1.services.social.microsoft.com.nsatc.net": null,
-"redir.metaservices.microsoft.com": null,
-"reports.wes.df.telemetry.microsoft.com": null,
-"services.wes.df.telemetry.microsoft.com": null,
-"settings-sandbox.data.microsoft.com": null,
-"settings-win.data.microsoft.com": null,
-"sqm.df.telemetry.microsoft.com": null,
-"sqm.telemetry.microsoft.com": null,
-"sqm.telemetry.microsoft.com.nsatc.net": null,
-"statsfe1.ws.microsoft.com": null,
-"statsfe2.update.microsoft.com.akadns.net": null,
-"statsfe2.ws.microsoft.com": null,
-"survey.watson.microsoft.com": null,
-"telecommand.telemetry.microsoft.com": null,
-"telecommand.telemetry.microsoft.com.nsatc.net": null,
-"telemetry.urs.microsoft.com": null,
-"vortex.data.microsoft.com": null,
-"vortex-sandbox.data.microsoft.com": null,
-"vortex-win.data.microsoft.com": null,
-"cy2.vortex.data.microsoft.com.akadns.net": null,
-"watson.microsoft.com": null,
-"watson.ppe.telemetry.microsoft.comwatson.telemetry.microsoft.com": null,
-"watson.telemetry.microsoft.com.nsatc.net": null,
-"wes.df.telemetry.microsoft.com": null,
-"win10.ipv6.microsoft.com": null,
-"www.bingads.microsoft.com": null };
-var good_da_host_exceptions_exact_flag = 39 > 0 ? true : false;  // test for non-zero number of rules
-
-// 2106 rules:
-var bad_da_host_JSON = { "jobthread.com": null,
-"syndication.exoclick.com": null,
-"content.ad": null,
-"nastydollars.com": null,
-"traffic.adexprtz.com": null,
-"lltrsknoob.click": null,
-"intab.site": null,
-"lucretius-ada.com": null,
-"trackerislive.com": null,
-"googletagmanager.com": null,
-"exoclick.com": null,
-"dumbpop.com": null,
-"adziff.com": null,
-"dianomi.com": null,
-"googleads.g.doubleclick.net": null,
-"serving-sys.com": null,
-"adchemy-content.com": null,
-"admitad.com": null,
-"amazon-adsystem.com": null,
-"chartbeat.com": null,
-"contentspread.net": null,
-"scorecardresearch.com": null,
-"webtrekk.net": null,
-"optimizely.com": null,
-"static.parsely.com": null,
-"addtoany.com": null,
-"ad.doubleclick.net": null,
-"nuggad.net": null,
-"clicktale.net": null,
-"rlcdn.com": null,
-"smartadserver.com": null,
-"adalliance.io": null,
-"teads.tv": null,
-"mxcdn.net": null,
-"stroeerdigitalmedia.de": null,
-"visualwebsiteoptimizer.com": null,
-"movad.net": null,
-"advertising.com": null,
-"adsafeprotected.com": null,
-"adnxs.com": null,
-"adverserve.net": null,
-"intelliad.de": null,
-"vix.criteo.net": null,
-"krxd.net": null,
-"hotjar.com": null,
-"xing-share.com": null,
-"crwdcntrl.net": null,
-"imglnkc.com": null,
-"g.doubleclick.net": null,
-"mediaplex.com": null,
-"contentexchange.me": null,
-"adition.com": null,
-"adform.net": null,
-"cpx.to": null,
-"cm.g.doubleclick.net": null,
-"xxlargepop.com": null,
-"banners.cams.com": null,
-"hpr.outbrain.com": null,
-"share.baidu.com": null,
-"alxsite.com": null,
-"prpopss.com": null,
-"bluekai.com": null,
-"openx.net": null,
-"pulsar.ebay.com": null,
-"addthis.com": null,
-"taboola.com": null,
-"bongacams.com": null,
-"doubleclick.net": null,
-"camiocw.com": null,
-"metricfast.com": null,
-"ufpcdn.com": null,
-"codedexchange.com": null,
-"popcash.net": null,
-"firstclass-download.com": null,
-"adsco.re": null,
-"smi2.ru": null,
-"adapd.com": null,
-"sharethis.com": null,
-"ebayobjects.com.au": null,
-"ad.proxy.sh": null,
-"cookie.support": null,
-"ads.yahoo.com": null,
-"clcknads.pro": null,
-"pixel.facebook.com": null,
-"adskeeper.co.uk": null,
-"eclick.baidu.com": null,
-"worldmapd.online": null,
-"quantserve.com": null,
-"log.outbrain.com": null,
-"analytics.chase.com": null,
-"trmnsite.com": null,
-"widget.crowdignite.com": null,
-"metrics.brightcove.com": null,
-"adult.xyz": null,
-"creativecdn.com": null,
-"shareaholic.com": null,
-"dnn506yrbagrg.cloudfront.net": null,
-"ltassrv.com.s3.amazonaws.com": null,
-"popads.net": null,
-"hornymatches.com": null,
-"flashtalking.com": null,
-"xclicks.net": null,
-"juicyads.com": null,
-"htmlhubing.xyz": null,
-"advertserve.com": null,
-"adjuggler.net": null,
-"3wr110.xyz": null,
-"clicksor.net": null,
-"clicksor.com": null,
-"am10.ru": null,
-"popwin.net": null,
-"click.scour.com": null,
-"rapidyl.net": null,
-"insta-cash.net": null,
-"mobsterbird.info": null,
-"explainidentifycoding.info": null,
-"utarget.ru": null,
-"prpops.com": null,
-"contentabc.com": null,
-"propellerpops.com": null,
-"liveadexchanger.com": null,
-"superadexchange.com": null,
-"downloadboutique.com": null,
-"adv.drtuber.com": null,
-"clickosmedia.com": null,
-"traffictraffickers.com": null,
-"connatix.com": null,
-"traktrafficflow.com": null,
-"ero-advertising.com": null,
-"onclickads.net": null,
-"track.xtrasize.nl": null,
-"pointclicktrack.com": null,
-"advmedialtd.com": null,
-"adcdnx.com": null,
-"adskpak.com": null,
-"adsrv4k.com": null,
-"adsurve.com": null,
-"media-servers.net": null,
-"adservme.com": null,
-"adsupply.com": null,
-"adserverplus.com": null,
-"adk2.co": null,
-"888media.net": null,
-"xtendmedia.com": null,
-"clicktripz.com": null,
-"adscpm.net": null,
-"adk2.com": null,
-"adcash.com": null,
-"adfox.yandex.ru": null,
-"ad6media.fr": null,
-"adsmarket.com": null,
-"adexchangetracker.com": null,
-"brandreachsys.com": null,
-"widget.yavli.com": null,
-"traffichaus.com": null,
-"trafficshop.com": null,
-"fpctraffic2.com": null,
-"trafficforce.com": null,
-"yieldtraffic.com": null,
-"trafficholder.com": null,
-"wigetmedia.com": null,
-"waframedia5.com": null,
-"mediaseeding.com": null,
-"pgmediaserve.com": null,
-"toroadvertisingmedia.com": null,
-"adtrace.org": null,
-"kissmetrics.com": null,
-"bettingpartners.com": null,
-"adblade.com": null,
-"clickfuse.com": null,
-"clickmngr.com": null,
-"clicksgear.com": null,
-"onclickmax.com": null,
-"poponclick.com": null,
-"clicksvenue.com": null,
-"terraclicks.com": null,
-"livepromotools.com": null,
-"admedit.net": null,
-"1phads.com": null,
-"padsdel.com": null,
-"popmyads.com": null,
-"down1oads.com": null,
-"affbuzzads.com": null,
-"megapopads.com": null,
-"epicgameads.com": null,
-"hipersushiads.com": null,
-"pwrads.net": null,
-"bullads.net": null,
-"adexc.net": null,
-"sexad.net": null,
-"statsmobi.com": null,
-"alternads.info": null,
-"youradexchange.com": null,
-"c4tracking01.com": null,
-"adbma.com": null,
-"adk2x.com": null,
-"ad131m.com": null,
-"adnium.com": null,
-"adxite.com": null,
-"ad4game.com": null,
-"adplxmd.com": null,
-"adrunnr.com": null,
-"adxprtz.com": null,
-"ad-maven.com": null,
-"adbetnet.com": null,
-"brucelead.com": null,
-"venturead.com": null,
-"adxpansion.com": null,
-"adultadworld.com": null,
-"admngronline.com": null,
-"august15download.com": null,
-"adexchangeprediction.com": null,
-"adnetworkperformance.com": null,
-"pos.baidu.com": null,
-"adbooth.com": null,
-"adonweb.ru": null,
-"onad.eu": null,
-"getclicky.com": null,
-"sharecash.org": null,
-"log.pinterest.com": null,
-"popunder.bid": null,
-"popin.cc": null,
-"shareasale.com": null,
-"mirtesen.ru": null,
-"tubeadvertising.eu": null,
-"aj1574.online": null,
-"tagcdn.com": null,
-"trk.freepik.com": null,
-"xxxmatch.com": null,
-"lofv.xyz": null,
-"warten-sie-mal.xyz": null,
-"vserv.bc.cdn.bitgravity.com": null,
-"clickr.xyz": null,
-"adbetclickin.pink": null,
-"perfectmarket.com": null,
-"adglare.net": null,
-"statictapcdn-a.akamaihd.net": null,
-"patiskcontentdelivery.info": null,
-"showcasead.com": null,
-"9content.com": null,
-"bestforexplmdb.com": null,
-"greatdexchange.com": null,
-"predictivadvertising.com": null,
-"bestquickcontentfiles.com": null,
-"affiliate.mediatemple.net": null,
-"affiliate-api.ti-media.net": null,
-"static.akacdn.ru": null,
-"fastclick.net": null,
-"affiliatesmedia.sbobet.com": null,
-"cdnmedia.xyz": null,
-"event-api.contactatonce.com.au": null,
-"tsyndicate.com": null,
-"adport.io": null,
-"affiliatehub.skybet.com": null,
-"vpnaffiliates.hidester.com": null,
-"webcams.com": null,
-"codeonclick.com": null,
-"zz.bdstatic.com": null,
-"trafficbroker.com": null,
-"trafficstars.com": null,
-"socialhoney.co": null,
-"static.kinghost.com": null,
-"revimedia.com": null,
-"ad.rambler.ru": null,
-"adright.co": null,
-"sail-horizon.com": null,
-"video-ad-stats.googlesyndication.com": null,
-"adexchangecloud.com": null,
-"cookietracker.cloudapp.net": null,
-"affiliate.heureka.cz": null,
-"nextoptim.com": null,
-"affiliates.lynda.com": null,
-"affiliates.cupidplc.com": null,
-"affiliates.minglematch.com": null,
-"tpc.googlesyndication.com": null,
-"affiliates.genealogybank.com": null,
-"chartaca.com": null,
-"affiliate.iamplify.com": null,
-"affiliates.mozy.com": null,
-"affiliates.myfax.com": null,
-"affiliates.mgmmirage.com": null,
-"affiliates.goodvibes.com": null,
-"affiliates.treasureisland.com": null,
-"affiliates.londonmarketing.com": null,
-"trackvoluum.com": null,
-"clickredirection.com": null,
-"onclicksuper.com": null,
-"pulseonclick.com": null,
-"topclickguru.com": null,
-"onclickmega.com": null,
-"gocp.stroeermediabrands.de": null,
-"googleadapis.l.google.com": null,
-"popunderjs.com": null,
-"www-google-analytics.l.google.com": null,
-"cdna.tremormedia.com": null,
-"affiliates.galapartners.co.uk": null,
-"pixel.wp.com": null,
-"adglare.org": null,
-"googleadservices.com": null,
-"affiliate.resellerclub.com": null,
-"hilltopads.net": null,
-"zanox-affiliate.de": null,
-"flagads.net": null,
-"affiliateprogram.keywordspy.com": null,
-"blamads-assets.s3.amazonaws.com": null,
-"stats.bitgravity.com": null,
-"adexchangemachine.com": null,
-"adexchangegate.com": null,
-"affiliates.vpn.ht": null,
-"advertiserurl.com": null,
-"affiliates.bookdepository.com": null,
-"histats.com": null,
-"quant.jp": null,
-"affiliates.homestead.com": null,
-"adhealers.com": null,
-"admeerkat.com": null,
-"cdnaz.win": null,
-"indieclick.com": null,
-"ad.kisscartoon.is": null,
-"optimize-stats.voxmedia.com": null,
-"cdn.trafficexchangelist.com": null,
-"sadskis.com": null,
-"newjulads.com": null,
-"adtng.com": null,
-"adtgs.com": null,
-"nextlandingads.com": null,
-"demandmedia.s3.amazonaws.com": null,
-"static.smi2.net": null,
-"diagnose.igstatic.com": null,
-"pubads.g.doubleclick.net": null,
-"ttdetect.staticimgfarm.com": null,
-"outbrainimg.com": null,
-"fyrsbckgi-c.global.ssl.fastly.net": null,
-"ccexperimentsstatic.oracleoutsourcing.com": null,
-"dfapvmql-q.global.ssl.fastly.net": null,
-"pr-static.empflix.com": null,
-"clarium.global.ssl.fastly.net": null,
-"affiliates.bookdepository.co.uk": null,
-"sportsbetaffiliates.com.au": null,
-"news-whistleout.s3.amazonaws.com": null,
-"filamentapp.s3.amazonaws.com": null,
-"bo-videos.s3.amazonaws.com": null,
-"jppolid-track.trackprod.integration.jppol.dk": null,
-"a3.hotpornfile.org": null,
-"pladform.ru": null,
-"s3-tracking.synthasite.net.s3.amazonaws.com": null,
-"widget.shopstyle.com.au": null,
-"popads.media": null,
-"followistic.com": null,
-"mixi.media": null,
-"dup.baidustatic.com": null,
-"strikeadcdn.s3.amazonaws.com": null,
-"filamentapp-assets.s3.amazonaws.com": null,
-"affilate-img-affasi.s3.amazonaws.com": null,
-"statsadv.dadapro.com": null,
-"widgetly.com": null,
-"sana.newsinc.com.s3.amazonaws.com": null,
-"revcontent.com": null,
-"traffic.tc-clicks.com": null,
-"a-counter.kiev.ua": null,
-"hello.staticstuff.net": null,
-"immassets.s3.amazonaws.com": null,
-"gfaf-banners.s3.amazonaws.com": null,
-"affiliationjs.s3.amazonaws.com": null,
-"twitter-badges.s3.amazonaws.com": null,
-"magnify360-cdn.s3.amazonaws.com": null,
-"tree-pixel-log.s3.amazonaws.com": null,
-"cdn-alliancegravity.s3.amazonaws.com": null,
-"advice-ads-cdn.vice.com": null,
-"epowernetworktrackerimages.s3.amazonaws.com": null,
-"survey.io": null,
-"affiliate.com": null,
-"adstat.4u.pl": null,
-"cdn.optmd.com": null,
-"affiliates.purevpn.com": null,
-"affiliation.planethoster.info": null,
-"js.stroeermediabrands.de": null,
-"cdn-analytics.ladmedia.fr": null,
-"staticsfs.host": null,
-"superwidget-assets.gowatchit.com": null,
-"popunders.bid": null,
-"track.atom-data.io": null,
-"cdn.offcloud.com": null,
-"entrecard.s3.amazonaws.com": null,
-"cadreon.s3.amazonaws.com": null,
-"lunametrics.wpengine.netdna-cdn.com": null,
-"inpref.s3.amazonaws.com": null,
-"brandads.net": null,
-"logs.datadoghq.com": null,
-"ptcdn.mbicash.nl": null,
-"engage-cdn.schibsted.media": null,
-"affiliategateways.co": null,
-"livestats.matrix.it": null,
-"plugin.ws": null,
-"webads.co.nz": null,
-"cdncache2-a.akamaihd.net": null,
-"mto.mediatakeout.com": null,
-"analytics-static.ugc.bazaarvoice.com": null,
-"survey.g.doubleclick.net": null,
-"afftrack.pro": null,
-"bid.g.doubleclick.net": null,
-"asdad.xyz": null,
-"blogads.com": null,
-"analytics.cmg.net": null,
-"advnet.xyz": null,
-"metric.gstatic.com": null,
-"ad.spreaker.com": null,
-"adsrv.us": null,
-"adz.zwee.ly": null,
-"adz.co.zw": null,
-"whistleout.s3.amazonaws.com": null,
-"mellowads.com": null,
-"tracking.shoptogether.buy.com": null,
-"cookielaw.org": null,
-"ip-adress.com": null,
-"eventtracker.videostrip.com": null,
-"ad.gt": null,
-"banner.themediaplanets.com": null,
-"mrskincash.com": null,
-"ads.sexier.com": null,
-"webcounter.ws": null,
-"acount.alley.ws": null,
-"traffictrader.net": null,
-"secretmedia.s3.amazonaws.com": null,
-"providence.voxmedia.com": null,
-"banners.ixitools.com": null,
-"phonograph2.voxmedia.com": null,
-"px.staticfiles.at": null,
-"staticiv.com": null,
-"f.staticlp.com": null,
-"data.minute.ly": null,
-"perr.h-cdn.com": null,
-"adthebest.online": null,
-"traffic-media.co.uk": null,
-"brand.net": null,
-"dashbida.com": null,
-"gtrk.s3.amazonaws.com": null,
-"smblock.s3.amazonaws.com": null,
-"gateways.s3.amazonaws.com": null,
-"rich-agent.s3.amazonaws.com": null,
-"kbnetworkz.s3.amazonaws.com": null,
-"airpushmarketing.s3.amazonaws.com": null,
-"thetradedesk-tags.s3.amazonaws.com": null,
-"stuff-nzwhistleout.s3.amazonaws.com": null,
-"leaddyno-client-images.s3.amazonaws.com": null,
-"d303e3cdddb4ded4b6ff495a7b496ed5.s3.amazonaws.com": null,
-"clicktale.pantherssl.com": null,
-"campanja.com": null,
-"partner.googleadservices.com": null,
-"affportal-lb.bevomedia.com": null,
-"analytics.mlstatic.com": null,
-"share.static.skyrock.net": null,
-"icn.brandnewapp.pro": null,
-"ad.smartclip.net": null,
-"blueparrot.media": null,
-"tracking.worldmedia.net": null,
-"getalinkandshare.com": null,
-"adserve.ph": null,
-"adsonar.com": null,
-"host-host-ads.com": null,
-"analytics.cnd-motionmedia.de": null,
-"localytics.com": null,
-"mobtop.ru": null,
-"awstaticdn.net": null,
-"cookiex.ngd.yahoo.com": null,
-"geo.yahoo.com": null,
-"partners.heart2heartnetwork.": null,
-"bannerexchange.com.au": null,
-"usenetnl.download": null,
-"stats.g.doubleclick.net": null,
-"private.camz.": null,
-"logger.pw": null,
-"analytics.163.com": null,
-"htl.bid": null,
-"adtools.gossipkings.com": null,
-"sevenads.net": null,
-"flagship.asp-host.co.uk": null,
-"dunderaffiliates.com": null,
-"horse-racing-affiliate-program.co.uk": null,
-"trakksocial.googlecode.com": null,
-"partner.bargaindomains.com": null,
-"partner.premiumdomains.com": null,
-"profile.bharatmatrimony.com": null,
-"partner.catchy.com": null,
-"indieclick.3janecdn.com": null,
-"winr.online": null,
-"valueclick.net": null,
-"eroticmix.blogspot.": null,
-"pmzktktfanzem.bid": null,
-"skimresources.com": null,
-"mail.advantagebusinessmedia.com": null,
-"videos.oms.eu": null,
-"gglscr.online": null,
-"afftrk.online": null,
-"aj1052.online": null,
-"aj1090.online": null,
-"aj1432.online": null,
-"aj1602.online": null,
-"aj1913.online": null,
-"bj1110.online": null,
-"fungus.online": null,
-"simpan.online": null,
-"rdsig.yahoo.co.jp": null,
-"adserve.com": null,
-"surveywall-api.survata.com": null,
-"ftigken.online": null,
-"grunkav.online": null,
-"clickz.lonelycheatingwives.com": null,
-"hallaert.online": null,
-"glaswall.online": null,
-"klubityd.online": null,
-"littitte.online": null,
-"nittlopp.online": null,
-"spaceruz.online": null,
-"vestlitt.online": null,
-"fmstigat.online": null,
-"banner1.pornhost.com": null,
-"analytic.rocks": null,
-"goldoffer.online": null,
-"andantask.online": null,
-"aptapebog.online": null,
-"aspampbrr.online": null,
-"bobarmale.online": null,
-"cutescale.online": null,
-"dashgreen.online": null,
-"flytomars.online": null,
-"leadiklod.online": null,
-"marapcana.online": null,
-"camalbbuy.online": null,
-"pornworld.online": null,
-"adm.shinobi.jp": null,
-"aimatch.com": null,
-"murkymouse.online": null,
-"serverflox.online": null,
-"goonline13.online": null,
-"cnstats.cdev.eu": null,
-"cdn.assets.gorillanation.com": null,
-"purplepatch.online": null,
-"abctrack.bid": null,
-"smiinformeri.online": null,
-"epnt.ebay.com": null,
-"clks003-glaze.online": null,
-"oneblackjocker.online": null,
-"track.youniversalmedia.com": null,
-"sprinklecontent.com": null,
-"ad.pickple.net": null,
-"data.gosquared.com": null,
-"video.oms.eu": null,
-"hosticanaffiliate.com": null,
-"incrediblethebest.online": null,
-"onestepproductions.online": null,
-"mediametrics.mpsa.com": null,
-"ptsc.shoplocal.com": null,
-"ad-apac.doubleclick.net": null,
-"ad-emea.doubleclick.net": null,
-"trafficfuelpixel.s3-us-west-2.amazonaws.com": null,
-"pixel.newscgp.com": null,
-"tags.cdn.circlesix.co": null,
-"creativefactory.zalando.": null,
-"affiliates.allposters.com": null,
-"livejasmin.tv": null,
-"pixel.cdnwidget.com": null,
-"sabin.free.fr": null,
-"ayc0zsm69431gfebd.xyz": null,
-"livestats.la7.tv": null,
-"counter.gd": null,
-"synthasite.net": null,
-"analytics.ladmedia.fr": null,
-"widgets.tapcdn.com": null,
-"buysellads.net": null,
-"ad.jamba.net": null,
-"stat.media": null,
-"data.glamour.ru": null,
-"affiliate.dtiserv.com": null,
-"sndkorea.nowcdn.co.kr": null,
-"beacon2.indieclicktv.com": null,
-"experianmarketingservices.digital": null,
-"pixel.solvemedia.com": null,
-"widgets.twimg.com": null,
-"clicks.istripper.com": null,
-"sessions.exchange": null,
-"plusone.google.com": null,
-"adc.9news.com.au": null,
-"ad.duga.jp": null,
-"counter.theconversation.edu.au": null,
-"analytics.yola.net": null,
-"tracking.ha.rueducommerce.fr": null,
-"ccpa-script.psg.nexstardigital.net": null,
-"adslot.com": null,
-"adsame.com": null,
-"facebookicon.net": null,
-"c.imedia.cz": null,
-"dc.tremormedia.com": null,
-"media.eurolive.com": null,
-"adhoc2.net": null,
-"pushads.biz": null,
-"counter.insales.ru": null,
-"affiliatenetwork.co.za": null,
-"freeusenet.rocks": null,
-"bid.run": null,
-"checkmy.cam": null,
-"ff.doubleclick.net": null,
-"sponsored.com": null,
-"top100-images.rambler.ru": null,
-"aeros02.tk": null,
-"aeros08.tk": null,
-"aeros01.tk": null,
-"syndication.jsadapi.com": null,
-"analytics.loop-cloud.de": null,
-"microsoftaffiliates.net": null,
-"mstat.ga": null,
-"promo.cams.com": null,
-"scriptall.tk": null,
-"ad.linksynergy.com": null,
-"valueaffiliate.net": null,
-"4affiliate.net": null,
-"r.msn.com": null,
-"pclick.europe.yahoo.com": null,
-"realpush.media": null,
-"letsgoshopping.tk": null,
-"datadome.co": null,
-"hoverr.media": null,
-"delivery-s3.adswizz.com": null,
-"webads.nl": null,
-"myscoop-tracking.googlecode.com": null,
-"b-m.xyz": null,
-"privy.com": null,
-"moneroocean.stream": null,
-"webassembly.stream": null,
-"intelensafrete.stream": null,
-"klapenlyidveln.stream": null,
-"spylog.com": null,
-"fotw.xyz": null,
-"hdat.xyz": null,
-"hhit.xyz": null,
-"neocounter.neoworx-blog-tools.net": null,
-"ys1pve.site": null,
-"yspicb.site": null,
-"aax-us-iad.amazon.com": null,
-"valueclick.com": null,
-"hivps.xyz": null,
-"avero.xyz": null,
-"retag.xyz": null,
-"ditds.xyz": null,
-"klkus.xyz": null,
-"yesra.xyz": null,
-"iclwy.xyz": null,
-"menuladshy.life": null,
-"ftigholm.site": null,
-"affiligay.net": null,
-"krison.xyz": null,
-"mation.xyz": null,
-"tmotbq.xyz": null,
-"yomeno.xyz": null,
-"pcruxm.xyz": null,
-"aimrawwas.site": null,
-"albarkale.site": null,
-"aleaidass.site": null,
-"alealebag.site": null,
-"ampallall.site": null,
-"anycadark.site": null,
-"areantaid.site": null,
-"armashair.site": null,
-"artapeare.site": null,
-"ashaidart.site": null,
-"ashamparm.site": null,
-"aspartbib.site": null,
-"batwaxwok.site": null,
-"boyalebut.site": null,
-"butashasp.site": null,
-"cadfixbig.site": null,
-"cueyetwee.site": null,
-"cupallask.site": null,
-"dayadopen.site": null,
-"emembersm.site": null,
-"errnaphim.site": null,
-"fagmomqua.site": null,
-"fibpeeode.site": null,
-"fibusedie.site": null,
-"fixsirrod.site": null,
-"hamadotax.site": null,
-"hoemasfat.site": null,
-"howbyehid.site": null,
-"kitferdog.site": null,
-"letheyemo.site": null,
-"mewnetwag.site": null,
-"munroadaz.site": null,
-"ofttanmob.site": null,
-"ogysevery.site": null,
-"ohonorpod.site": null,
-"outsimfat.site": null,
-"padpitnon.site": null,
-"pryrhoohs.site": null,
-"punpisurn.site": null,
-"puntoenun.site": null,
-"sexagogal.site": null,
-"slykeyhot.site": null,
-"soltitate.site": null,
-"styheremo.site": null,
-"wizwarsum.site": null,
-"yawsupvie.site": null,
-"yonatefin.site": null,
-"lh.secure.yahoo.com": null,
-"besiasmere.site": null,
-"esentdemol.site": null,
-"gesymphone.site": null,
-"housandady.site": null,
-"onwaysebuj.site": null,
-"pcommaging.site": null,
-"phenylketh.site": null,
-"sheltenham.site": null,
-"thomagejut.site": null,
-"underwards.site": null,
-"womentunyd.site": null,
-"janrain.xyz": null,
-"erberos.xyz": null,
-"erxalim.xyz": null,
-"fyredet.xyz": null,
-"juricts.xyz": null,
-"mitatic.xyz": null,
-"qxssmah.xyz": null,
-"utillib.xyz": null,
-"albireo.xyz": null,
-"patoris.xyz": null,
-"data.queryly.com": null,
-"agreenikeru.site": null,
-"anatomicele.site": null,
-"arnessaudie.site": null,
-"arpartments.site": null,
-"becauseared.site": null,
-"certakesime.site": null,
-"ctureencroo.site": null,
-"denotatorum.site": null,
-"disappenedy.site": null,
-"donconferen.site": null,
-"embargainew.site": null,
-"geodestricy.site": null,
-"memoralegil.site": null,
-"mohammequhe.site": null,
-"mortionalgo.site": null,
-"mslimitages.site": null,
-"nedinchestw.site": null,
-"nsoncandred.site": null,
-"overnmentil.site": null,
-"pabhagivene.site": null,
-"propeanikob.site": null,
-"rdingperhan.site": null,
-"santrateduk.site": null,
-"specularpro.site": null,
-"successageq.site": null,
-"swoodlander.site": null,
-"swoodlandsu.site": null,
-"themselvebu.site": null,
-"torytalenty.site": null,
-"tremembersy.site": null,
-"weinberinaz.site": null,
-"westerdayeu.site": null,
-"yestedshere.site": null,
-"yeuropertsp.site": null,
-"zroundancez.site": null,
-"alemoney.xyz": null,
-"proj2018.xyz": null,
-"tidafors.xyz": null,
-"beholder.xyz": null,
-"checkapi.xyz": null,
-"gunnepaa.xyz": null,
-"imzahrwl.xyz": null,
-"mp3toavi.xyz": null,
-"norvalur.xyz": null,
-"permenor.xyz": null,
-"qrzlaatf.xyz": null,
-"wranjeon.xyz": null,
-"ficusoid.xyz": null,
-"elatumal.xyz": null,
-"ergeiros.xyz": null,
-"kxqvnfcg.xyz": null,
-"accompathych.site": null,
-"anotherederi.site": null,
-"assumineuron.site": null,
-"aughedbannel.site": null,
-"brinarynuker.site": null,
-"christingera.site": null,
-"churchasisou.site": null,
-"companiedoml.site": null,
-"constrongyfe.site": null,
-"continelyfas.site": null,
-"crimentasaju.site": null,
-"croomskosmos.site": null,
-"deatheriwevo.site": null,
-"decisionediv.site": null,
-"demannewcure.site": null,
-"dhappeasesem.site": null,
-"distinesseqe.site": null,
-"dregardianfl.site": null,
-"dspleastanci.site": null,
-"econdardseeg.site": null,
-"encoursejaso.site": null,
-"esconcentleu.site": null,
-"etsmercisely.site": null,
-"famountsuref.site": null,
-"fancialeldak.site": null,
-"feedinburgew.site": null,
-"forwayonlibe.site": null,
-"gebralefukim.site": null,
-"hincludingse.site": null,
-"hourselflosu.site": null,
-"latviancedef.site": null,
-"leavilysover.site": null,
-"littlementok.site": null,
-"ljamingrepre.site": null,
-"magnificohec.site": null,
-"manatomicbru.site": null,
-"marwinhitted.site": null,
-"mentalbackie.site": null,
-"miserintesto.site": null,
-"morazormands.site": null,
-"ncialappropo.site": null,
-"ndersotherei.site": null,
-"northyatters.site": null,
-"otentieschoo.site": null,
-"ovementerter.site": null,
-"pertycleaner.site": null,
-"pinocularoud.site": null,
-"plathwardsve.site": null,
-"practingunef.site": null,
-"presearchity.site": null,
-"processaryen.site": null,
-"propeanfanku.site": null,
-"provisituske.site": null,
-"remarypolike.site": null,
-"returnessety.site": null,
-"rightenedetu.site": null,
-"rschairwaydi.site": null,
-"sainstandset.site": null,
-"saturalerdax.site": null,
-"severymurden.site": null,
-"soldinggrily.site": null,
-"solutelynewt.site": null,
-"spendeivivar.site": null,
-"stakenpolise.site": null,
-"strialcurity.site": null,
-"sundersetrgh.site": null,
-"superjuryger.site": null,
-"surgermystem.site": null,
-"taveredezeri.site": null,
-"teachievedim.site": null,
-"thernouverge.site": null,
-"thighlykamsh.site": null,
-"trouvredawes.site": null,
-"ttheathereco.site": null,
-"undedsunbese.site": null,
-"untabilityde.site": null,
-"verdriusuref.site": null,
-"westerdayeol.site": null,
-"withougheves.site": null,
-"abroadlynijiz.site": null,
-"absolubleldan.site": null,
-"acceptiongere.site": null,
-"acceptionijes.site": null,
-"amesgraduatel.site": null,
-"anglishreasts.site": null,
-"antfindicater.site": null,
-"appropolyfunt.site": null,
-"badgearsregra.site": null,
-"balanderramed.site": null,
-"belgradualuna.site": null,
-"bersmanatomic.site": null,
-"bledevellinga.site": null,
-"chairwaydenew.site": null,
-"churchasisrev.site": null,
-"cleaneryelded.site": null,
-"clineddivoryr.site": null,
-"congregorysun.site": null,
-"consesculifin.site": null,
-"dditingwetlan.site": null,
-"dlevisionexpr.site": null,
-"edspicuousind.site": null,
-"effectionerew.site": null,
-"elastinabuker.site": null,
-"eldedtickered.site": null,
-"eswaldderinao.site": null,
-"extrementtgfa.site": null,
-"feelinedbusin.site": null,
-"forcementsawe.site": null,
-"frequestabure.site": null,
-"grenatorkovsh.site": null,
-"grifictuberal.site": null,
-"healthoutabol.site": null,
-"histormedengi.site": null,
-"intinuedbgyuj.site": null,
-"lereforeightc.site": null,
-"levenileheshe.site": null,
-"lisconcertain.site": null,
-"minsistereron.site": null,
-"mitsczechoesy.site": null,
-"monastersincl.site": null,
-"mortionaletak.site": null,
-"mslimitagesmo.site": null,
-"munitedoploko.site": null,
-"neitherspreta.site": null,
-"nvitdeservala.site": null,
-"oloniansyello.site": null,
-"paratingsulik.site": null,
-"pattentinevec.site": null,
-"perhangeflets.site": null,
-"prographiciko.site": null,
-"rebrancardera.site": null,
-"releasurezesa.site": null,
-"retingsyphilo.site": null,
-"ronbriticated.site": null,
-"sarydrinkletr.site": null,
-"sikelypleaste.site": null,
-"sincernething.site": null,
-"sprintainokeg.site": null,
-"striesastanov.site": null,
-"strikersucces.site": null,
-"substandferex.site": null,
-"suitarserviku.site": null,
-"sultiyearsena.site": null,
-"symphoneupcom.site": null,
-"theatredveres.site": null,
-"tiontablyvern.site": null,
-"tutorinforget.site": null,
-"twenticiseflo.site": null,
-"verageousarra.site": null,
-"volutionorigi.site": null,
-"warsalsintrol.site": null,
-"winsistakesme.site": null,
-"afftrack.com": null,
-"aleinvest.xyz": null,
-"keapeiros.xyz": null,
-"quicktask.xyz": null,
-"flac2flac.xyz": null,
-"arketscolourse.site": null,
-"arpromiserinte.site": null,
-"briticatederfd.site": null,
-"coloniansheraz.site": null,
-"comparencelabl.site": null,
-"concentleconse.site": null,
-"courselfnorter.site": null,
-"defeatureother.site": null,
-"definitedikdra.site": null,
-"earsawclearnph.site": null,
-"electureenbeli.site": null,
-"electureencroo.site": null,
-"europertsticke.site": null,
-"gospecularavch.site": null,
-"himselvepostly.site": null,
-"hurchasisounci.site": null,
-"indicaterhools.site": null,
-"jincreasteregy.site": null,
-"ldingchristing.site": null,
-"lesburghmoloki.site": null,
-"librarierserty.site": null,
-"linkeinvitable.site": null,
-"lylibertleveni.site": null,
-"onesegreativec.site": null,
-"originedreting.site": null,
-"ouncialliberte.site": null,
-"paraterinchest.site": null,
-"remainttalenty.site": null,
-"solicensusuntf.site": null,
-"successarysazh.site": null,
-"ustriptomorbie.site": null,
-"voterialijikol.site": null,
-"ydrinkletremem.site": null,
-"attributiontrackingga.googlecode.com": null,
-"alappropolylibe.site": null,
-"christingsugged.site": null,
-"decordingaudied.site": null,
-"distrikerkvazar.site": null,
-"effectionothere.site": null,
-"entineffieldsta.site": null,
-"feedinburgmands.site": null,
-"ffickiedisticre.site": null,
-"findicaterperty.site": null,
-"histlingklakson.site": null,
-"limitagesdidjet.site": null,
-"linstanintedter.site": null,
-"listeraislatory.site": null,
-"merciselyancies.site": null,
-"offickiekizashi.site": null,
-"promiserkololla.site": null,
-"reforeightolikm.site": null,
-"regardianpleast.site": null,
-"rtionalgospecul.site": null,
-"sightcoloniansy.site": null,
-"syphilohmmaging.site": null,
-"trikersuccessar.site": null,
-"ustralpublicate.site": null,
-"villandopingcon.site": null,
-"yellorsanarolik.site": null,
-"chiasephim.xyz": null,
-"impeacknow.xyz": null,
-"mostviewed.xyz": null,
-"tchhelpdmn.xyz": null,
-"uriqirelle.xyz": null,
-"cesikelylibrarie.site": null,
-"christinglatvian.site": null,
-"gnativestreesaga.site": null,
-"potentionsdarket.site": null,
-"sculifinanthools.site": null,
-"ellorschairwaydis.site": null,
-"ineffieldinforget.site": null,
-"stoffickiesolding.site": null,
-"truestioncarefore.site": null,
-"filecatcher.xyz": null,
-"xtremeserve.xyz": null,
-"tracking.fanbridge.com": null,
-"mataharirama.xyz": null,
-"cookiechoices.org": null,
-"webstat.se": null,
-"bloggergreetbox.googlecode.com": null,
-"bat.adforum.com": null,
-"buysellads.com": null,
-"search.twitter.com": null,
-"campartner.com": null,
-"widgets.lendingtree.com": null,
-"ad.smartmediarep.com": null,
-"spylog.ru": null,
-"analytics.us.archive.org": null,
-"ad.aquamediadirect.com": null,
-"locotrack.net": null,
-"webtraffic.ttinet.com": null,
-"track.pnicnik.live": null,
-"bluhostedbanners.blucigs.com": null,
-"webads.eu": null,
-"images.dreamhost.com": null,
-"analytic.xingcloud.com": null,
-"doubleclick.com": null,
-"analitycs.net": null,
-"track.written.com": null,
-"counter.cnw.cz": null,
-"partners.vouchedfor.co.uk": null,
-"adca.st": null,
-"adserved.net": null,
-"track.searchiq.co": null,
-"affiliate.juno.co.uk": null,
-"cdn.hiido.cn": null,
-"share.yandex.ru": null,
-"affilbox.cz": null,
-"drowadri.racing": null,
-"epu.sh": null,
-"wpu.sh": null,
-"etracker.de": null,
-"imp.clickability.com": null,
-"firebaselogging.googleapis.com": null,
-"cookiemonster.is": null,
-"sponsorselect.com": null,
-"andbeyond.media": null,
-"data.neuroxmedia.com": null,
-"h.imedia.cz": null,
-"a.livesportmedia.eu": null,
-"underdog.media": null,
-"cookies.reedbusiness.nl": null,
-"adclick.lv": null,
-"convrse.media": null,
-"novelty.media": null,
-"luxbetaffiliates.com.au": null,
-"webpu.sh": null,
-"ladbrokesaffiliates.com.au": null,
-"pclick.internal.yahoo.com": null,
-"widget.weibo.com": null,
-"widgetssec.cam-content.com": null,
-"tracking.livingsocial.com": null,
-"analoganalytics.com": null,
-"clickcdn.co": null,
-"p.adbrn.com": null,
-"sync.tv": null,
-"analytics.newscred.com": null,
-"aio.media": null,
-"m32.media": null,
-"nui.media": null,
-"track.byzon.swelen.net": null,
-"stats.smartclip.net": null,
-"metrics.ctvdigital.net": null,
-"adnet.lt": null,
-"nativepu.sh": null,
-"p2ads.com": null,
-"yieldads.com": null,
-"gourmetads.com": null,
-"jads.co": null,
-"affili.st": null,
-"click.suning.cn": null,
-"adss.yahoo.com": null,
-"performancingads.com": null,
-"mediatraffic.com": null,
-"anti-bot.baidu.com": null,
-"g-stats.openhost.es": null,
-"mailmunch.s3.amazonaws.com": null,
-"stats3.unrulymedia.com": null,
-"nedstat.net": null,
-"logger.co.kr": null,
-"twittericon.com": null,
-"logql.yahoo.co.jp": null,
-"stats.propublica.org": null,
-"widgets.fie-data.co.uk": null,
-"salefile.googlecode.com": null,
-"adjuggler.com": null,
-"imgpop.googlecode.com": null,
-"teralog.techhub.co.kr": null,
-"shinystat.it": null,
-"share.itraffic.su": null,
-"stats.netbopdev.co.uk": null,
-"webstat.net": null,
-"nimiq.watch": null,
-"tracking.chacha.com": null,
-"media.match.com": null,
-"urlcash.net": null,
-"tracking.plattformad.com": null,
-"webstat.kuwo.cn": null,
-"gateway-banner.eravage.com": null,
-"visits.lt": null,
-"ebay.northernhost.com": null,
-"imp.ad-plus.cn": null,
-"affilijack.de": null,
-"tracker.euroweb.net": null,
-"speee-ad.jp": null,
-"onhercam.com": null,
-"partners.xpertmarket.com": null,
-"partners.optiontide.com": null,
-"webstat.no": null,
-"partners.fshealth.com": null,
-"cdn1.pebx.pl": null,
-"partners.badongo.com": null,
-"partners.rochen.com": null,
-"forex-affiliate.net": null,
-"join.whitegfs.com": null,
-"roia.hutchmedia.com": null,
-"clickpathmedia.com": null,
-"btbuckets.com": null,
-"subscribers.click": null,
-"ad.realmcdn.net": null,
-"scribe.twitter.com": null,
-"webstats.sapo.pt": null,
-"iframes.hustler.com": null,
-"tracking.to": null,
-"dotmetrics.net": null,
-"ad.livere.co.kr": null,
-"tagbucket.cc": null,
-"analyticcdn.globalmailer.com": null,
-"cpm.biz": null,
-"playuhd.host": null,
-"ad.yieldpartners.com": null,
-"tracker.calameo.com": null,
-"freegeoip.app": null,
-"click.ali213.net": null,
-"adnet.vn": null,
-"toolbar.cdn.gigya.com": null,
-"stats.binki.es": null,
-"widget.imshopping.com": null,
-"adcde.com": null,
-"retrack.q-divisioncdn.de": null,
-"click.eyk.net": null,
-"xfast.host": null,
-"accounts.pkr.com": null,
-"betrad.com": null,
-"affiliationcash.com": null,
-"pixel.ad": null,
-"anybest.site": null,
-"ecommstats.s3.amazonaws.com": null,
-"clickio.mgr.consensu.org": null,
-"services.hmhost.co.uk": null,
-"activetracker.activehotels.com": null,
-"netcounter.de": null,
-"stats.nebula.fi": null,
-"fastcounter.de": null,
-"comscore.com": null,
-"aboutads.quantcast.com": null,
-"webstat.com": null,
-"hashforcash.us": null,
-"adtrack.calls.net": null,
-"metrics.n-tv.de": null,
-"etracker.com": null,
-"adserving.unibet.com": null,
-"bounceexchange.com": null,
-"simplereach.com": null,
-"syndicate.payloadz.com": null,
-"cmp.nextday.media": null,
-"popunder.ru": null,
-"tracking.ukwm.co.uk": null,
-"justdating.online": null,
-"bzclk.baidu.com": null,
-"wkctj.baidu.com": null,
-"globaldating.online": null,
-"affiliation.filestube.com": null,
-"count.fr": null,
-"nedstat.com": null,
-"adservicemedia.dk": null,
-"igg.biz": null,
-"sv2.biz": null,
-"indextools.com": null,
-"yourlocalguardian-gb.yourlocalguardian.co.uk": null,
-"beacon.indieclicktv.com": null,
-"adopshost.me": null,
-"youtube.local": null,
-"pmbox.biz": null,
-"ezytrack.com": null,
-"amp.rd.linksynergy.com": null,
-"mtracking.com": null,
-"trackuity.com": null,
-"ad.style": null,
-"affiliation.fotovista.com": null,
-"unrulymedia.com": null,
-"g-cash.biz": null,
-"3gporn.biz": null,
-"livestats.fr": null,
-"igaming.biz": null,
-"topeuro.biz": null,
-"dosugcz.biz": null,
-"tracking202.com": null,
-"wt.adtrue24.com": null,
-"tags.msnbc.com": null,
-"clickstream.co.za": null,
-"gan.doubleclick.net": null,
-"counter.nn.ru": null,
-"whitepush.biz": null,
-"cashworld.biz": null,
-"mixmarket.biz": null,
-"lifepromo.biz": null,
-"log.snapdeal.com": null,
-"analyticsengine.s3.amazonaws.com": null,
-"top100.ru": null,
-"tradescape.biz": null,
-"securesurf.biz": null,
-"adstonesik.club": null,
-"directtrack.com": null,
-"linkredirect.biz": null,
-"ingenioustech.biz": null,
-"xn--17921-iua.biz": null,
-"xn--18225-zta.biz": null,
-"xn--20531-uua.biz": null,
-"record.sportsbetaffiliates.com.au": null,
-"filetarget.net": null,
-"atlas.astrology.com": null,
-"athenainstitute.biz": null,
-"pixel.watch": null,
-"popmonetizer.net": null,
-"scout.haymarketmedia.com": null,
-"smiling.video": null,
-"widgetadvertising.biz": null,
-"czx5eyk0exbhwp43ya.biz": null,
-"gsp1.baidu.com": null,
-"mobylog.jp": null,
-"blaaaa12.googlecode.com": null,
-"impressionperformance.biz": null,
-"stats.ulixes.pl": null,
-"mystats.nl": null,
-"silverpop.com": null,
-"repixel.co": null,
-"stats.tunt.lv": null,
-"beacons.mediamelon.com": null,
-"pixelpop.co": null,
-"purevideo.com": null,
-"usocial.pro": null,
-"stats.asp24.pl": null,
-"carbonads.com": null,
-"shoppanda.co": null,
-"screencapturewidget.aebn.net": null,
-"onlinereserchstatistics.online": null,
-"count.im": null,
-"exponderle.pro": null,
-"i4track.net": null,
-"content.livesportmedia.eu": null,
-"simicaseros.pro": null,
-"webstats.com": null,
-"stat.4u.pl": null,
-"linkwelove.it": null,
-"aileenvideos.pro": null,
-"jodellvideos.pro": null,
-"alahnavideos.pro": null,
-"top100.rambler.ru": null,
-"leastersmiled.pro": null,
-"stats.itweb.co.za": null,
-"powercount.jswelt.de": null,
-"bloggerex.com": null,
-"affiliateedge.eu": null,
-"cpu2cash.link": null,
-"alma-cmp.almamedia.io": null,
-"fcmatch.google.com": null,
-"widgets.solaramerica.org": null,
-"bannerflow.com": null,
-"scontent.services.tvn.pl": null,
-"img.servint.net": null,
-"traffic.acwebconnecting.com": null,
-"widget.firefeeder.com": null,
-"adclickmedia.com": null,
-"traffic.buyservices.com": null,
-"trackicollect.ibase.fr": null,
-"pixel.tuko.co.ke": null,
-"api.facebook.com": null,
-"stats.grafikart.fr": null,
-"tracker-id.cdiscount.com": null,
-"forex-affiliate.com": null,
-"im.ov.yahoo.co.jp": null,
-"secondchancetrack.fun": null,
-"bats.video.yahoo.com": null,
-"ondu.ru": null,
-"cszz.ru": null,
-"inrd.ru": null,
-"tbex.ru": null,
-"vira.ru": null,
-"am11.ru": null,
-"imho.ru": null,
-"prre.ru": null,
-"sape.ru": null,
-"cpl1.ru": null,
-"okeo.ru": null,
-"banners.fuckbookhookups.com": null,
-"browser-updater.yandex.net": null,
-"scounter.rambler.ru": null,
-"geobanner.sexfinder.com": null,
-"tubechat.eu": null,
-"tubepush.eu": null,
-"bitx.tv": null,
-"laim.tv": null,
-"3wnp9.ru": null,
-"mokuz.ru": null,
-"luxup.ru": null,
-"mpuls.ru": null,
-"ntvk1.ru": null,
-"sceno.ru": null,
-"vihub.ru": null,
-"kadam.ru": null,
-"toget.ru": null,
-"tracker.affiliate.iqoption.com": null,
-"pix.speedbit.com": null,
-"getgamers.eu": null,
-"metricool.com": null,
-"luxup2.ru": null,
-"ucfeed.ru": null,
-"hitmir.ru": null,
-"idntfy.ru": null,
-"madnet.ru": null,
-"wwgate.ru": null,
-"acales.ru": null,
-"alemon.ru": null,
-"m-shes.ru": null,
-"morgdm.ru": null,
-"sspicy.ru": null,
-"hikvar.ru": null,
-"abakys.ru": null,
-"d0main.ru": null,
-"ningme.ru": null,
-"rareru.ru": null,
-"stats.searchftps.org": null,
-"count.yandeg.ru": null,
-"garss.tv": null,
-"dawin.tv": null,
-"affec.tv": null,
-"adnet.de": null,
-"media.netrefer.com": null,
-"media.mykodial.com": null,
-"rem-track.bild.de": null,
-"core.queerclick.com": null,
-"badge.facebook.com": null,
-"adscendmedia.com": null,
-"pushiki.ru": null,
-"pushvip.ru": null,
-"uralweb.ru": null,
-"dzizsih.ru": null,
-"gdeslon.ru": null,
-"iryazan.ru": null,
-"kmindex.ru": null,
-"listtop.ru": null,
-"livetex.ru": null,
-"tnative.ru": null,
-"webturn.ru": null,
-"ali-crm.ru": null,
-"et-code.ru": null,
-"kavanga.ru": null,
-"nonpaly.ru": null,
-"ovtopli.ru": null,
-"styleui.ru": null,
-"umekana.ru": null,
-"inheart.ru": null,
-"niuosnd.ru": null,
-"pardina.ru": null,
-"smartbn.ru": null,
-"vogozae.ru": null,
-"webstatistik.odav.de": null,
-"stats.paste2.org": null,
-"extend.tv": null,
-"group-ib.ru": null,
-"s7target.ru": null,
-"nextbdom.ru": null,
-"terethat.ru": null,
-"interakt.ru": null,
-"intergid.ru": null,
-"rutarget.ru": null,
-"serating.ru": null,
-"mentalks.ru": null,
-"paradocs.ru": null,
-"rekovers.ru": null,
-"smartadv.ru": null,
-"gamesims.ru": null,
-"goallurl.ru": null,
-"pkeeper3.ru": null,
-"protizer.ru": null,
-"telvanil.ru": null,
-"traffbiz.ru": null,
-"vogorana.ru": null,
-"vsexshop.ru": null,
-"adsforallmedia.com": null,
-"trk.adbutter.net": null,
-"pvstat.china.cn": null,
-"onlinepbx.ru": null,
-"real5traf.ru": null,
-"apkonline.ru": null,
-"directcrm.ru": null,
-"e-kuzbass.ru": null,
-"faststart.ru": null,
-"vidigital.ru": null,
-"aliadvert.ru": null,
-"alibestru.ru": null,
-"vogo-vogo.ru": null,
-"geofamily.ru": null,
-"webteaser.ru": null,
-"zaehler.tv": null,
-"shoofle.tv": null,
-"populr.me": null,
-"push-money.ru": null,
-"pushkintop.ru": null,
-"pushprofit.ru": null,
-"webtalking.ru": null,
-"goodadvert.ru": null,
-"uwonderful.ru": null,
-"porno-file.ru": null,
-"surfingbird.ru": null,
-"botdetector.ru": null,
-"epnredirect.ru": null,
-"primechoice.ru": null,
-"millioncash.ru": null,
-"platform.iteratehq.com": null,
-"stats.lt": null,
-"nddmcconmqsy.ru": null,
-"announcement.ru": null,
-"lugansk-info.ru": null,
-"drivenetwork.ru": null,
-"digitaltarget.ru": null,
-"instreamvideo.ru": null,
-"promo-reklama.ru": null,
-"analytics.nike.com": null,
-"sitestat.com": null,
-"etzbnfuigipwvs.ru": null,
-"cbs.wondershare.com": null,
-"nativeroll.tv": null,
-"directchat.tv": null,
-"affiliates.eblastengine.com": null,
-"sometrics.com": null,
-"tracking.mobile.de": null,
-"track.addevent.com": null,
-"clickmap.ch": null,
-"skytvonline.tv": null,
-"aff.biz": null,
-"tracking.maxcdn.com": null,
-"widgets.getpocket.com": null,
-"zqtk.net": null,
-"lkqd.net": null,
-"track.thebase.in": null,
-"analytics.anvato.net": null,
-"deliv.lexpress.fr": null,
-"egamiplatform.tv": null,
-"redads.biz": null,
-"springmetrics.com": null,
-"adsession.com": null,
-"affiliates.thrixxx.com": null,
-"coremetrics.com": null,
-"adsrv.me": null,
-"mobi24.net": null,
-"omtrdc.net": null,
-"mobred.net": null,
-"popxxx.net": null,
-"brandaffinity.net": null,
-"anyinstalldealtheclicks.icu": null,
-"tracking.sportsbet.": null,
-"realclick.co.kr": null,
-"cellstats.mako.co.il": null,
-"speee-ad.akamaized.net": null,
-"fastapi.net": null,
-"popclck.net": null,
-"waycash.net": null,
-"mobizme.net": null,
-"rotaban.ru": null,
-"adnet.biz": null,
-"stats.searchftps.net": null,
-"pop.fapxl.com": null,
-"cogmatch.net": null,
-"rapidtrk.net": null,
-"cashcave.net": null,
-"yupfiles.net": null,
-"ziphoumt.net": null,
-"imgwzzmb.net": null,
-"trafiq.party": null,
-"microad.jp": null,
-"blueconic.net": null,
-"geoplugin.net": null,
-"go-mpulse.net": null,
-"mobalyzer.net": null,
-"afcontent.net": null,
-"pixfuture.net": null,
-"videoroll.net": null,
-"yldmgrimg.net": null,
-"juicycash.net": null,
-"stats2.com": null,
-"stats.videodelivery.net": null,
-"a04296f070c0146f314d-0dcad72565cb350972beb3666a86f246.r50.cf5.rackcdn.com": null,
-"crosspixel.net": null,
-"aicontents.net": null,
-"getcontent.net": null,
-"poprevenue.net": null,
-"cam-lolita.net": null,
-"media.onlineteachers.co.in": null,
-"v.emedia.cn": null,
-"instawidget.net": null,
-"monkeyminer.net": null,
-"webtrekk-us.net": null,
-"free-domain.net": null,
-"tradeexpert.net": null,
-"247teencash.net": null,
-"monkeybroker.net": null,
-"datexchanges.net": null,
-"tmform.azurewebsites.net": null,
-"adboost.com": null,
-"tkn.4tube.com": null,
-"microad.net": null,
-"countus.fr": null,
-"contadordevisitas.es": null,
-"contentsquare.net": null,
-"rockincontent.net": null,
-"webtrekk-asia.net": null,
-"content-square.net": null,
-"kaizenplatform.net": null,
-"contentwidgets.net": null,
-"imageadvantage.net": null,
-"linkexchangers.net": null,
-"media.net": null,
-"escape.insites.eu": null,
-"visitors.sourcingmap.com": null,
-"sessioncam.com": null,
-"socialsexnetwork.net": null,
-"iotechnologies.com": null,
-"sagimedyer.xyz": null,
-"count.me.uk": null,
-"roia.biz": null,
-"xtracker.pro": null,
-"content-recommendation.net": null,
-"cdn.mobicow.com": null,
-"usage.seibert-media.io": null,
-"slipstream.skyscanner.net": null,
-"stats.vk-portal.net": null,
-"tracker.twenga.": null,
-"analysis.fi": null,
-"hemnes.win": null,
-"bloglines.com": null,
-"media.mykocam.com": null,
-"myvisitors.se": null,
-"adsixmedia.fr": null,
-"shinystat.com": null,
-"beacon.examiner.com": null,
-"static.tradetracker.net": null,
-"loggly.com": null,
-"suntcontent.se": null,
-"gripdownload.co": null,
-"analytics-rhwg.rhcloud.com": null,
-"analytics.twitter.com": null,
-"tracker.publico.pt": null,
-"page-events-ustats.udemy.com": null,
-"beacons.brandads.net": null,
-"ubt.berlingskemedia.net": null,
-"hashing.win": null,
-"adnet.com": null,
-"remotefilez.info": null,
-"solutionzip.info": null,
-"teasernet.ru": null,
-"promotools.biz": null,
-"herofandhist.info": null,
-"antdivisitlodg.info": null,
-"contentdigital.info": null,
-"hyperboardupil.info": null,
-"rsdescriptsrem.info": null,
-"pixiv.org": null,
-"attacketslovern.info": null,
-"therebelfasters.info": null,
-"adtaily.pl": null,
-"widgets.itaringa.net": null,
-"contentr.net": null,
-"cashtrafic.info": null,
-"forttantontherdown.info": null,
-"seecontentdelivery.info": null,
-"webcontentdelivery.info": null,
-"zumcontentdelivery.info": null,
-"hurchaseeffectionpe.info": null,
-"inewcontentdelivery.info": null,
-"requiredcollectfilm.info": null,
-"x.fidelity-media.com": null,
-"tce.alicdn.com": null,
-"atanx.alicdn.com": null,
-"webcounter.goweb.de": null,
-"fxox4wvv.win": null,
-"direct-events-collector.spot.im": null,
-"24smile.org": null,
-"adnet.ru": null,
-"stats.technopia.it": null,
-"adsupplyads.net": null,
-"sociallist.org": null,
-"maximainvest.net": null,
-"freegeoip.net": null,
-"popt.in": null,
-"freewebfonts.org": null,
-"tracker.stats.in.th": null,
-"lindon-pool.win": null,
-"swiftmining.win": null,
-"shareitpp.com": null,
-"adsdk.com": null,
-"tag.aticdn.net": null,
-"tracking.olx.": null,
-"counter.hackers.lv": null,
-"gnezdo.ru": null,
-"acmsg.online": null,
-"onlineshopping.website": null,
-"aj2073.online": null,
-"globwo.online": null,
-"nol.yahoo.com": null,
-"krenovo.online": null,
-"wapdollar.in": null,
-"vpnfortorrents.cc": null,
-"ntv.io": null,
-"newsm247.online": null,
-"yield-op-idsync.live.streamtheworld.com": null,
-"artandand.online": null,
-"askaspalb.online": null,
-"cryartarm.online": null,
-"imgstat.baidu.com": null,
-"stats.itsol.it": null,
-"ganon.yahoo.com": null,
-"adsoptimal.com": null,
-"stats.aplus.com": null,
-"ohmchoicechi.online": null,
-"webtraffic.se": null,
-"track2.me": null,
-"wysistat.com": null,
-"webtrends.com": null,
-"stats.mako.co.il": null,
-"hbid.ams3.cdn.digitaloceanspaces.com": null,
-"localads-statistics.maps.me": null,
-"special-offers.online": null,
-"beap-bc.yahoo.com": null,
-"onestat.com": null,
-"cqcounter.com": null,
-"jscounter.com": null,
-"nativeads.com": null,
-"tr.cloud-media.fr": null,
-"litix.io": null,
-"cmstool.youku.com": null,
-"stats.frankfurterneuepresse.de": null,
-"anon-stats.eff.org": null,
-"affiliate-b.com": null,
-"affiliateer.com": null,
-"tbaffiliate.com": null,
-"myaffiliates.com": null,
-"osiaffiliate.com": null,
-"sbaffiliates.com": null,
-"pstats.com": null,
-"special-promotions.online": null,
-"affiliatefuel.com": null,
-"iframe.adultfriendfinder.com": null,
-"lessite.pro": null,
-"affiliates-pro.com": null,
-"affiliate-gate.com": null,
-"mojoaffiliates.com": null,
-"roxyaffiliates.com": null,
-"1rxntv.io": null,
-"365sbaffiliates.com": null,
-"affiliate-robot.com": null,
-"affiliatefuture.com": null,
-"affiliategroove.com": null,
-"affiliatelounge.com": null,
-"affiliatesensor.com": null,
-"dsnr-affiliates.com": null,
-"giantaffiliates.com": null,
-"jumboaffiliates.com": null,
-"rummyaffiliates.com": null,
-"affiliatewindow.com": null,
-"track.netzero.net": null,
-"bet365affiliates.com": null,
-"bingo4affiliates.com": null,
-"iasbetaffiliates.com": null,
-"checkstat.nl": null,
-"metrics.aviasales.ru": null,
-"adswizz.com": null,
-"lotteryaffiliates.com": null,
-"rewardsaffiliates.com": null,
-"teambetaffiliates.com": null,
-"conversions.genieventures.co.uk": null,
-"wtstats.com": null,
-"myaffiliateprogram.com": null,
-"stargamesaffiliate.com": null,
-"questradeaffiliates.com": null,
-"affiliatemembership.com": null,
-"anastasiasaffiliate.com": null,
-"autoaffiliatenetwork.com": null,
-"rogueaffiliatesystem.com": null,
-"log.tagtic.cn": null,
-"widget.adviceiq.com": null,
-"healthaffiliatesnetwork.com": null,
-"csi.gstatic.com": null,
-"freestar.io": null,
-"audriasite.pro": null,
-"superstats.com": null,
-"cdnmaster.cn": null,
-"partner-ads.com": null,
-"dashboard.io": null,
-"stats.cz": null,
-"analytics.matchbin.com": null,
-"creativetv.pro": null,
-"sync.outbrain.com": null,
-"stats.digital-natives.de": null,
-"track.qcri.org": null,
-"the-adult-company.com": null,
-"dolphincdn.xyz": null,
-"stats.united-domains.de": null,
-"metrics.ee.co.uk": null,
-"adamatic.co": null,
-"webtracker.jp": null,
-"adcell.de": null,
-"quickmoneyanswers.org": null,
-"analytics.staticiv.com": null,
-"stats.fittkaumaass.de": null,
-"doubleclickbygoogle.com": null,
-"clickdimensions.com": null,
-"traffic4u.nl": null,
-"euwidget.imshopping.com": null,
-"fcmatch.youtube.com": null,
-"track.cedsdigital.it": null,
-"g.msn.com": null,
-"humanclick.com": null,
-"ads.cc": null,
-"counter2.condenast.it": null,
-"agkn.com": null,
-"254a.com": null,
-"imp.affiliator.com": null,
-"ml314.com": null,
-"b1img.com": null,
-"bkrtx.com": null,
-"dwin2.com": null,
-"tcimg.com": null,
-"0pixl.com": null,
-"3lift.com": null,
-"bfast.com": null,
-"imglt.com": null,
-"popnc.com": null,
-"yldbt.com": null,
-"xzipy.com": null,
-"stats.fr": null,
-"gvisit.com": null,
-"rfksrv.com": null,
-"amgdgt.com": null,
-"dispop.com": null,
-"mgcash.com": null,
-"mobday.com": null,
-"mobfox.com": null,
-"mobtyb.com": null,
-"pixxur.com": null,
-"pmpubs.com": null,
-"popcpm.com": null,
-"pulpix.com": null,
-"rtbpop.com": null,
-"camzap.com": null,
-"fncash.com": null,
-"nscash.com": null,
-"pecash.com": null,
-"popmog.com": null,
-"loveme.com": null,
-"bestdeals.ws": null,
-"cookie.gazeta.pl": null,
-"social9.com": null,
-"exponea.com": null,
-"iesnare.com": null,
-"mathtag.com": null,
-"tvpixel.com": null,
-"mimgoal.com": null,
-"dochase.com": null,
-"epacash.com": null,
-"indexww.com": null,
-"kikuzip.com": null,
-"mobisla.com": null,
-"mobtrks.com": null,
-"pop-rev.com": null,
-"popearn.com": null,
-"populis.com": null,
-"unlockr.com": null,
-"mobgold.com": null,
-"camduty.com": null,
-"deecash.com": null,
-"filexan.com": null,
-"fmscash.com": null,
-"ggwcash.com": null,
-"gl-cash.com": null,
-"imglnka.com": null,
-"imglnkb.com": null,
-"itmcash.com": null,
-"luvcash.com": null,
-"maxcash.com": null,
-"mobbobr.com": null,
-"mpmcash.com": null,
-"rivcash.com": null,
-"siccash.com": null,
-"tubeadv.com": null,
-"wamcash.com": null,
-"yazcash.com": null,
-"adexchangeguru.com": null,
-"statistics.ro": null,
-"trackpush.com": null,
-"wisepops.com": null,
-"loveclaw.com": null,
-"trustarc.com": null,
-"fanplayr.com": null,
-"parrable.com": null,
-"pixeleze.com": null,
-"scriptil.com": null,
-"cashbigo.com": null,
-"cashinme.com": null,
-"expogrim.com": null,
-"gmzdaily.com": null,
-"mobatori.com": null,
-"mobicont.com": null,
-"mobifobi.com": null,
-"mobstrks.com": null,
-"mobytrks.com": null,
-"myadcash.com": null,
-"onscroll.com": null,
-"popmajor.com": null,
-"poppysol.com": null,
-"sexmoney.com": null,
-"smilered.com": null,
-"targaubs.com": null,
-"usercash.com": null,
-"videoegg.com": null,
-"videohub.com": null,
-"visitweb.com": null,
-"zipropyl.com": null,
-"hjbfpopj.com": null,
-"oztzipze.com": null,
-"ypixrvxi.com": null,
-"aztecash.com": null,
-"cam4flat.com": null,
-"camcrush.com": null,
-"camdough.com": null,
-"camprime.com": null,
-"camsense.com": null,
-"camsoda1.com": null,
-"cashthat.com": null,
-"crakcash.com": null,
-"divascam.com": null,
-"fuelbuck.com": null,
-"javbucks.com": null,
-"popander.com": null,
-"rexbucks.com": null,
-"vod-cash.com": null,
-"xlovecam.com": null,
-"datefree.com": null,
-"fast-thinking.co.uk": null,
-"submitexpress.co.uk": null,
-"widgets.adviceiq.com": null,
-"eyereturn.com": null,
-"insideall.com": null,
-"devscroll.com": null,
-"pinddeals.com": null,
-"botsvisit.com": null,
-"exposebox.com": null,
-"gbotvisit.com": null,
-"getfreebl.com": null,
-"mbotvisit.com": null,
-"ping-fast.com": null,
-"popsample.com": null,
-"scripts21.com": null,
-"social-sb.com": null,
-"visitorjs.com": null,
-"ybotvisit.com": null,
-"ajplugins.com": null,
-"broaddoor.com": null,
-"shopnetic.com": null,
-"cash-duck.com": null,
-"contentjs.com": null,
-"dollarade.com": null,
-"expocrack.com": null,
-"fandelcot.com": null,
-"fast2earn.com": null,
-"gold-file.com": null,
-"hmongcash.com": null,
-"imgsniper.com": null,
-"mobile-10.com": null,
-"mobiright.com": null,
-"mobiyield.com": null,
-"moborobot.com": null,
-"pharmcash.com": null,
-"popmarker.com": null,
-"popunderz.com": null,
-"realmatch.com": null,
-"seegamese.com": null,
-"shopalyst.com": null,
-"shopzyapp.com": null,
-"tubemogul.com": null,
-"videoadex.com": null,
-"yieldlove.com": null,
-"yottacash.com": null,
-"zangocash.com": null,
-"pndelfast.com": null,
-"nyacampwk.com": null,
-"true2file.com": null,
-"cljmarinq.com": null,
-"jbzdpixig.com": null,
-"ldvmpopwd.com": null,
-"ljucamkqc.com": null,
-"vezipelsr.com": null,
-"boinkcash.com": null,
-"cashlayer.com": null,
-"fleshcash.com": null,
-"gamevui24.com": null,
-"idolbucks.com": null,
-"lovercash.com": null,
-"mobalives.com": null,
-"prscripts.com": null,
-"ptwebcams.com": null,
-"vividcash.com": null,
-"wildmatch.com": null,
-"yurivideo.com": null,
-"ziphentai.com": null,
-"dealspure.com": null,
-"fileloadr.com": null,
-"shopilize.com": null,
-"future-hawk-content.co.uk": null,
-"flashgroup.com": null,
-"secretrune.com": null,
-"snapwidget.com": null,
-"socialvibe.com": null,
-"readrboard.com": null,
-"socialrest.com": null,
-"tweetboard.com": null,
-"c1exchange.com": null,
-"e-contenta.com": null,
-"whitepixel.com": null,
-"yext-pixel.com": null,
-"investhash.com": null,
-"carscannon.com": null,
-"cr-nielsen.com": null,
-"botscanner.com": null,
-"100widgets.com": null,
-"ampxchange.com": null,
-"camakaroda.com": null,
-"cb-content.com": null,
-"class2deal.com": null,
-"contenture.com": null,
-"defaultimg.com": null,
-"europacash.com": null,
-"freeskreen.com": null,
-"gamecetera.com": null,
-"ibillboard.com": null,
-"igameunion.com": null,
-"imgfeedget.com": null,
-"imgwebfeed.com": null,
-"keywordpop.com": null,
-"meendocash.com": null,
-"mgcashgate.com": null,
-"mgplatform.com": null,
-"mobidevdom.com": null,
-"moregamers.com": null,
-"tubereplay.com": null,
-"videodeals.com": null,
-"ye185hcamw.com": null,
-"abodealley.com": null,
-"forexplmdb.com": null,
-"bjshimgqbc.com": null,
-"dpixysnllk.com": null,
-"oyndqimgof.com": null,
-"swpopynngk.com": null,
-"udvxwimgqr.com": null,
-"belamicash.com": null,
-"bumblecash.com": null,
-"danzabucks.com": null,
-"hotsocials.com": null,
-"ideal-sexe.com": null,
-"jaymancash.com": null,
-"mallorcash.com": null,
-"methodcash.com": null,
-"nikkiscash.com": null,
-"octopuspop.com": null,
-"royal-cash.com": null,
-"seemybucks.com": null,
-"sexplaycam.com": null,
-"spunkycash.com": null,
-"tech-board.com": null,
-"tubedspots.com": null,
-"webcambait.com": null,
-"wifelovers.com": null,
-"secretmedia.com": null,
-"wpush.biz": null,
-"clickthru.lefbc.com": null,
-"dotnetkicks.com": null,
-"socialoomph.com": null,
-"socialtwist.com": null,
-"widgetsplus.com": null,
-"socialannex.com": null,
-"twinesocial.com": null,
-"campaigncog.com": null,
-"cashburners.com": null,
-"email-match.com": null,
-"explore-123.com": null,
-"id-visitors.com": null,
-"les-experts.com": null,
-"provenpixel.com": null,
-"silvergamed.com": null,
-"visitorpath.com": null,
-"webiqonline.com": null,
-"bidsxchange.com": null,
-"bruceleadx1.com": null,
-"cashmylinks.com": null,
-"class64deal.com": null,
-"connexplace.com": null,
-"dealcurrent.com": null,
-"dexplatform.com": null,
-"empiremoney.com": null,
-"exponential.com": null,
-"freerotator.com": null,
-"getpopunder.com": null,
-"getscriptjs.com": null,
-"moneycosmos.com": null,
-"pip-pip-pop.com": null,
-"points2shop.com": null,
-"smilewanted.com": null,
-"socialbirth.com": null,
-"socialreach.com": null,
-"socialspark.com": null,
-"spotxchange.com": null,
-"trombocrack.com": null,
-"truefilen32.com": null,
-"widgetbucks.com": null,
-"downloadgot.com": null,
-"rtbvideobox.com": null,
-"cap-cap-pop.com": null,
-"cashcawrite.com": null,
-"thurnflfant.com": null,
-"expsevdkqyr.com": null,
-"board-books.com": null,
-"cameraprive.com": null,
-"hiddenbucks.com": null,
-"hookupbucks.com": null,
-"iheartbucks.com": null,
-"loveadverts.com": null,
-"matrix-cash.com": null,
-"newnudecash.com": null,
-"pictureturn.com": null,
-"realitycash.com": null,
-"sexdatecash.com": null,
-"twistyscash.com": null,
-"webcampromo.com": null,
-"redzxxxtube.com": null,
-"screenpopper.com": null,
-"thelovebucks.com": null,
-"socialmarker.com": null,
-"linkxchanger.com": null,
-"pixelrevenue.com": null,
-"placemypixel.com": null,
-"visitorglobe.com": null,
-"visitorville.com": null,
-"gulliblecamp.com": null,
-"secretturtle.com": null,
-"selfcampaign.com": null,
-"pagerankfree.com": null,
-"contentsfeed.com": null,
-"cash4members.com": null,
-"castplatform.com": null,
-"checkoutfree.com": null,
-"eredexpendin.com": null,
-"freegamespub.com": null,
-"gamesrevenue.com": null,
-"ihookupdaily.com": null,
-"intextscript.com": null,
-"linkexchange.com": null,
-"moneywhisper.com": null,
-"popularitish.com": null,
-"popunderzone.com": null,
-"seriousfiles.com": null,
-"video-loader.com": null,
-"videoindigen.com": null,
-"1sen-pit-fan.com": null,
-"zip-zip-swan.com": null,
-"fanaticalfly.com": null,
-"camrfajedgku.com": null,
-"imgkcxjlrlqf.com": null,
-"jjfankvlnhhm.com": null,
-"maxgirlgames.com": null,
-"pixjqfvlsqvu.com": null,
-"popzkvfimbox.com": null,
-"connect.facebook.com": null,
-"connect.facebook.net": null,
-"platform.twitter.com": null,
-"api.areametrics.com": null,
-"api.beaconsinspace.com": null,
-"mobileapi.mobiquitynetworks.com": null,
-"incoming-data-sense360.s3.amazonaws.com": null,
-"ios-quinoa-events-prod.sense360eng.com": null,
-"ios-quinoa-high-frequency-events-prod.sense360eng.com": null,
-"v1.blueberry.cloud.databerries.com": null,
-"outbrain.com": null };
-var bad_da_host_exact_flag = 2106 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 7 rules as an efficient NFA RegExp:
-var bad_da_host_RegExp = /^(?:[\w-]+\.)*?(?:tracking(?=([\s\S]*?\.euroads\.fi))\1|tracker(?=([\s\S]*?\.richcasino\.com))\2|images\.(?=([\s\S]*?\.criteo\.net))\3|vix\.(?=([\s\S]*?\.criteo\.net))\4|rcm(?=([\s\S]*?\.amazon\.))\5|vtnlog\-(?=([\s\S]*?\.elb\.amazonaws\.com))\6|collector\-(?=([\s\S]*?\.elb\.amazonaws\.com))\7)/i;
-var bad_da_host_regex_flag = 7 > 0 ? true : false;  // test for non-zero number of rules
-
-// 454 rules:
-var bad_da_hostpath_JSON = { "facebook.com/plugins/like.php": null,
-"depositfiles.com/stats.php": null,
-"ad.atdmt.com/i/a.html": null,
-"ad.atdmt.com/i/a.js": null,
-"widgets.outbrain.com/nativeVideoPlayer/NVPInjector.min.js": null,
-"imagesnake.com/includes/js/pops.js": null,
-"assets.pinterest.com/js/pinit.js": null,
-"baidu.com/js/log.js": null,
-"facebook.com/plugins/likebox.php": null,
-"voyeurhit.com/get_country.php": null,
-"facebook.com/plugins/page.php": null,
-"google-analytics.com/analytics.js": null,
-"viglink.com/images/pixel.gif": null,
-"linkconnector.com/traffic_record.php": null,
-"shopify.com/track.js": null,
-"autoline-top.com/counter.php": null,
-"redtube.com/js/track.js": null,
-"facebook.com/common/scribe_endpoint.php": null,
-"tubepornclassic.com/js/111.js": null,
-"pimpandhost.com/static/html/iframe.html": null,
-"newsarama.com/social.php": null,
-"movad.de/c.ount": null,
-"plista.com/iframeShowItem.php": null,
-"cloudfront.net/log.js": null,
-"baidu.com/h.js": null,
-"facebook.com/plugins/share_button.php": null,
-"eastmoney.com/counter.js": null,
-"breakingburner.com/stats.html": null,
-"googletagservices.com/dcm/dcmads.js": null,
-"s-msn.com/s/js/loader/activity/trackloader.min.js": null,
-"google-analytics.com/siteopt.js": null,
-"microsoft.com/getsilverlight/scripts/silverlight/SilverlightAtlas-MSCOM-Tracking.js": null,
-"klm.com/travel/generic/static/js/measure_async.js": null,
-"staticworld.net/pixel.gif": null,
-"hulkshare.com/stats.php": null,
-"brightcove.com/1pix.gif": null,
-"b.marfeelcache.com/statics/marfeel/gardac-sync.js": null,
-"ragezone.com/wp-content/uploads/2019/02/Widget_HF.png": null,
-"sexvideogif.com/msn.js": null,
-"mnginteractive.com/live/js/omniture/SiteCatalystCode_H_22_1_NC.js": null,
-"optimizely.com/js/geo.js": null,
-"soe.com/js/web-platform/web-data-tracker.js": null,
-"adap.tv/redir/client/static/as3adplayer.swf": null,
-"ilsole24ore.com/static/js/track.js": null,
-"naptol.com/usr/local/csp/staticContent/js/ga.js": null,
-"forms.aweber.com/form/styled_popovers_and_lightboxes.js": null,
-"paypal.com/acquisition-app/static/js/s_code.js": null,
-"webconfs.com/wp-content/uploads/2017/08/300x250bw.png": null,
-"audiusa.com/us/brand/en.usertracking_javascript.js": null,
-"amazonaws.com/pmb-musics/download_itunes.png": null,
-"fncstatic.com/static/all/js/geo.js": null,
-"picturevip.com/imagehost/top_banners.html": null,
-"websiteseochecker.com/img/banner_adsy.jpg": null,
-"store.yahoo.net/lib/directron/icons-test02.jpg": null,
-"hotdeals360.com/static/js/kpwidgetweb.js": null,
-"lightboxcdn.com/static/identity.html": null,
-"unblockedpiratebay.com/static/img/bar.gif": null,
-"privacytool.org/AnonymityChecker/js/fontdetect.js": null,
-"s.yimg.jp/images/listing/tool/cv/ytag.js": null,
-"cloudfront.net/scripts/js3caf.js": null,
-"imagesnake.com/includes/js/cat.js": null,
-"careerwebsite.com/distrib_pages/jobs.cfm": null,
-"kxcdn.com/track.js": null,
-"domainapps.com/assets/img/domain-apps.gif": null,
-"weibo.com/staticjs/weiboshare.html": null,
-"ragezone.com/wp-content/uploads/2019/02/chawk.jpg": null,
-"usnews.com/static/esi/usn-geo.json": null,
-"androidfilehost.com/libs/otf/stats.otf.php": null,
-"quintcareers.4jobs.com/Common/JavaScript/functions.tracking.js": null,
-"sexier.com/services/adsredirect.ashx": null,
-"wccftech.com/wp-content/uploads/2020/07/3asfgsaf.jpg": null,
-"wccftech.com/wp-content/uploads/2020/07/4pasofopf.jpg": null,
-"wccftech.com/wp-content/uploads/2020/07/2asgfkhasf.jpg": null,
-"wccftech.com/wp-content/uploads/2020/07/1asflkasjhf.jpg": null,
-"cruisesalefinder.co.nz/affiliates.html": null,
-"aircanada.com/shared/common/sitecatalyst/s_code.js": null,
-"cdnplanet.com/static/rum/rum.js": null,
-"healthcarejobsite.com/Common/JavaScript/functions.tracking.js": null,
-"google-analytics.com/ga_exp.js": null,
-"nih.gov/medlineplus/images/mplus_en_survey.js": null,
-"sexilation.com/wp-content/uploads/2013/01/Untitled-1.jpg": null,
-"investegate.co.uk/Weblogs/IGLog.aspx": null,
-"libertyblitzkrieg.com/wp-content/uploads/2012/09/cc200x300.gif": null,
-"atom-data.io/session/latest/track.html": null,
-"viglink.com/api/widgets/offerbox.js": null,
-"webtutoriaux.com/services/compteur-visiteurs/index.php": null,
-"worldnow.com/global/tools/video/Namespace_VideoReporting_DW.js": null,
-"imageteam.org/upload/big/2014/06/22/53a7181b378cb.png": null,
-"ino.com/img/sites/mkt/click.gif": null,
-"staticice.com.au/cgi-bin/stats.cgi": null,
-"statig.com.br/pub/setCookie.js": null,
-"assets.tumblr.com/assets/html/iframe/teaser.html": null,
-"cams.com/p/cams/cpcs/streaminfo.cgi": null,
-"pinterest.com/v1/urls/count.json": null,
-"guim.co.uk/guardian/thirdparty/tv-site/side.html": null,
-"shopping.com/sc/pac/sdc_widget_v2.0_proxy.js": null,
-"merchantcircle.com/static/track.js": null,
-"downloadsmais.com/imagens/download-direto.gif": null,
-"pubarticles.com/add_hits_by_user_click.php": null,
-"omgubuntu.co.uk/wp-content/plugins/omg-magnific/magnific.min.js": null,
-"lexus.com/lexus-share/js/campaign_tracking.js": null,
-"dragonstatic.com/parking/js/track.js": null,
-"freedoflondon.com/Styles/dialog-popup/jquery-ui.js": null,
-"assets.tumblr.com/assets/html/iframe/o.html": null,
-"google-analytics.com/analytics_debug.js": null,
-"gr8.cc/assets/img/btcclicks.png": null,
-"cgmlab.com/tools/geotarget/custombanner.js": null,
-"24hourfitness.com/includes/script/siteTracking.js": null,
-"sporcle.com/adn/yaktrack.php": null,
-"pimpandhost.com/images/pah-download.gif": null,
-"mailjet.com/statics/js/widget.modal.js": null,
-"s-msn.com/br/gbl/js/2/report.js": null,
-"myanimelist.net/static/logging.html": null,
-"wagital.com/Wagital-Ads.html": null,
-"expressen.se/static/scripts/s_code.js": null,
-"facebook.com/offsite_event.php": null,
-"twitvid.com/mediaplayer/players/tracker.swf": null,
-"js.static.m1905.cn/pingd.js": null,
-"cardstore.com/affiliate.jsp": null,
-"hostingtoolbox.com/bin/Count.cgi": null,
-"prospects.ac.uk/assets/js/prospectsWebTrends.js": null,
-"yimg.com/dy/ads/readmo.js": null,
-"viralogy.com/javascript/viralogy_tracker.js": null,
-"wccftech.com/wp-content/uploads/2020/05/nQAFHYZIydOGnIAKwmuY.jpg": null,
-"isitelab.io/ite_sitecomV1ANA.min.js": null,
-"images.military.com/pixel.gif": null,
-"monkeyquest.com/monkeyquest/static/js/ga.js": null,
-"assets.pinterest.com/pidget.html": null,
-"razor.tv/site/servlet/tracker.jsp": null,
-"klaviyo.com/onsite/js/klaviyo.js": null,
-"apis.google.com/js/platform.js": null,
-"beyond.com/common/track/trackgeneral.asp": null,
-"russellgrant.com/hostedsearch/panelcounter.aspx": null,
-"redditstatic.com/ads/pixel.js": null,
-"wiilovemario.com/images/fc-twin-play-nes-snes-cartridges.png": null,
-"javhd.com/ascripts/gcu.js": null,
-"cdnweb.aoscdn.com/hawkeye.js": null,
-"google-analytics.com/internal/analytics.js": null,
-"watchseries.to/piwik.js": null,
-"b.cdnst.net/javascript/amazon.js": null,
-"scriptlance.com/cgi-bin/freelancers/ref_click.cgi": null,
-"cdn.cdncomputer.com/js/main.js": null,
-"google-analytics.com/cx/api.js": null,
-"mailmax.co.nz/login/open.php": null,
-"cv.ee/static/stat.php": null,
-"linkwithin.com/pixel.png": null,
-"nbcudigitaladops.com/hosted/housepix.gif": null,
-"ced-ns.sascdn.com/diff/js/smart.js": null,
-"youtube-nocookie.com/robots.txt": null,
-"rightmove.co.uk/ps/images/logging/timer.gif": null,
-"travel.mediaalpha.com/js/serve.js": null,
-"virginholidays.co.uk/_assets/js/dc_storm/track.js": null,
-"international-property.countrylife.co.uk/js/search_widget.js": null,
-"magicaffiliateplugin.com/img/mga-125x125.gif": null,
-"js.adv.dadapro.net/collector.js/prcy.js": null,
-"cdnmaster.com/sitemaster/sm360.js": null,
-"facebook.com/whitepages/wpminiprofile.php": null,
-"netzero.net/account/event.do": null,
-"literatureandlatte.com/gfx/buynowaffiliate.jpg": null,
-"amazonaws.com/ad_w_intersitial.html": null,
-"boobieblog.com/submityourbitchbanner3.jpg": null,
-"xxxselected.com/cdn_files/dist/js/blockPlaces.js": null,
-"hunstoncanoeclub.co.uk/media/system/js/modal.js": null,
-"playgirl.com/pg/media/prolong_ad.png": null,
-"devilgirls.co/images/devil.gif": null,
-"zylom.com/pixel.jsp": null,
-"xcams.com/livecams/pub_collante/script.php": null,
-"log.player.cntv.cn/stat.html": null,
-"cloudfront.net/analytics.js": null,
-"highwebmedia.com/CACHE/js/output.92c98302d256.js": null,
-"sourceforge.net/images/mlopen_post.html": null,
-"localmonero.co/static/ga.js": null,
-"map.baidu.com/newmap_test/static/common/images/transparent.gif": null,
-"onsugar.com/static/ck.php": null,
-"webmd.com/dtmcms/live/webmd/PageBuilder_Assets/JS/oas35.js": null,
-"adultmastercash.com/e1.php": null,
-"stats.screenresolution.org/get.php": null,
-"fastly.net/sp.js": null,
-"cloudzilla.to/cam/wpop.php": null,
-"scotts.com/smg/js/omni/customTracking.js": null,
-"alluremedia.com.au/s/au.js": null,
-"bpath.com/count.dll": null,
-"burntorangereport.com/upload/scripts/popup.js": null,
-"storage.data-vp.com/vp/t.js": null,
-"skyrock.net/img/pix.gif": null,
-"washingtonpost.com/wp-srv/wapolabs/dw/readomniturecookie.html": null,
-"mercuryinsurance.com/static/js/s_code.js": null,
-"v.blog.sohu.com/dostat.do": null,
-"lijit.com/adif_px.php": null,
-"hulu.com/google_conversion_video_view_tracking.html": null,
-"vixy.net/fb-traffic-pop.js": null,
-"edvantage.com.sg/site/servlet/tracker.jsp": null,
-"mansion.com/mts.tracker.js": null,
-"qbn.com/media/static/js/ga.js": null,
-"akamaihd.net/lmedianet.js": null,
-"momtastic.com/libraries/pebblebed/js/pb.track.js": null,
-"theconversation.com/javascripts/lib/content_tracker_hook.js": null,
-"playomat.de/sfye_noscript.php": null,
-"wittgenstein.it/wp-content/themes/wittgenstein/images/ilpost.png": null,
-"eurotrucksimulator2.com/images/logo_blog.png": null,
-"ph.hillcountrytexas.com/imp.php": null,
-"shareit.com/affiliate.html": null,
-"filmlinks4u.net/twatch/jslogger.php": null,
-"naughtyblog.org/pr1pop.js": null,
-"dict.cc/img/fbplus1.png": null,
-"radioreference.com/i/p4/tp/smPortalBanner.gif": null,
-"vanityfair.com/hotzones/src/ads.js": null,
-"ukrd.com/images/icons/itunes.png": null,
-"redtube.com/_status/pix.php": null,
-"dirittierisposte.it/Images/corriere_sera.png": null,
-"s3.amazonaws.com/dmas-public/rubicon/bundle.js": null,
-"droidnetwork.net/img/dt-atv160.jpg": null,
-"gammasites.com/pornication/pc_browsable.php": null,
-"wsj.net/MW5/content/analytics/hooks.js": null,
-"newstatesman.com/js/NewStatesmanSDC.js": null,
-"newasiantv.tv/files/a300x250.html": null,
-"ecustomeropinions.com/survey/nojs.php": null,
-"egg.com/rum/data.gif": null,
-"nih.gov/share/scripts/survey.js": null,
-"jeuxvideo.com/contenu/medias/video/countv.php": null,
-"radio-canada.ca/lib/TrueSight/markerFile.gif": null,
-"sofascore.com/geoip.js": null,
-"imgbabes.com/ja.html": null,
-"windowsphone.com/scripts/siteTracking.js": null,
-"iamhansen.xyz/2-320x50.gif": null,
-"pornizer.com/_Themes/javascript/cts.js": null,
-"d27s92d8z1yatv.cloudfront.net/js/jquery.jw.analitycs.js": null,
-"tfl.gov.uk/tfl-global/scripts/stats-config.js": null,
-"c.woopic.com/tools/pdb.min.js": null,
-"facebook.com/plugins/recommendations.php": null,
-"o.aolcdn.com/js/mg1.js": null,
-"free.fr/cgi-bin/wwwcount.cgi": null,
-"surveymonkey.com/jspop.aspx": null,
-"nabble.com/static/analytics.js": null,
-"videoszoofiliahd.com/wp-content/themes/vz/js/p.js": null,
-"easytutoriel.com/wp-content/themes/easytutoriel-10-1/js/scripts.js": null,
-"vimeocdn.com/js_opt/ablincoln_combined.min.js": null,
-"linuxtracker.org/images/dw.png": null,
-"validome.org/valilogger/track.js": null,
-"boobieblog.com/TilaTequilaBackdoorBanner2.jpg": null,
-"trwl1.com/ascripts/gcrt.js": null,
-"vcnewsdaily.com/images/vcnews_right_banner.gif": null,
-"skyrock.net/js/stats_blog.js": null,
-"stargames.com/bridge.asp": null,
-"shortnews.de/iframes/view_news.cfm": null,
-"fujifilm.com/js/shared/analyzer.js": null,
-"pixlee.com/assets/pixlee_events.js": null,
-"tfl.gov.uk/tfl-global/scripts/stats.js": null,
-"imgbabes.com/ero-foo.html": null,
-"adrive.com/images/fc_banner.jpg": null,
-"seesaawiki.jp/img/rainman.gif": null,
-"bdstatic.com/linksubmit/push.js": null,
-"cloudfront.net/vis_opt.js": null,
-"video.syfy.com/lg.php": null,
-"tube18.sex/player/html.php": null,
-"memepix.com/spark.php": null,
-"hdm-stuttgart.de/count.cgi": null,
-"worldnow.com/images/incoming/RTJ/rtj201303fall.jpg": null,
-"thedailybeast.com/appnexus.js": null,
-"platform.twitter.com/anywhere.js": null,
-"graytvinc.com/images/twitterlogo.png": null,
-"milanofinanza.it/img/top.png": null,
-"monstertube.com/images/bottom-features.jpg": null,
-"jutarnji.hr/template/js/eph_analytics.js": null,
-"wired.com/tracker.js": null,
-"swatchseries.to/jquery.min.js": null,
-"twitter.com/1.1/promoted_content/log.json": null,
-"sap.com/global/ui/js/trackinghelper.js": null,
-"ana.net/contentimage/genicon/twitter.png": null,
-"dealnews.com/lw/ul.php": null,
-"facebook.com/widgets/activity.php": null,
-"flixist.com/img2.phtml": null,
-"destructoid.com/img2.phtml": null,
-"ford.com/ngtemplates/ngassets/com/forddirect/ng/newMetrics.js": null,
-"facebook.com/plugins/facepile.php": null,
-"racebets.com/media.php": null,
-"print2webcorp.com/mkt3/_js/p2w_tracker.js": null,
-"oscars.org/scripts/wt_include1.js": null,
-"oscars.org/scripts/wt_include2.js": null,
-"oodle.com/js/suntracking.js": null,
-"widgethost.com/pax/counter.js": null,
-"tipsport.org/scripts/closure.js": null,
-"buzzamedia.com/js/track.js": null,
-"cloudfront.net/track.html": null,
-"24video.net/din_new6.php": null,
-"arstechnica.com/dragons/breath.gif": null,
-"wapinda.in/images/downloadvideo.jpg": null,
-"ford.com/ngtemplates/ngassets/ford/general/scripts/js/galleryMetrics.js": null,
-"digitalgov.gov/Universal-Federated-Analytics-Min.js": null,
-"yellowbrix.com/images/content/cimage.gif": null,
-"webhostingtalk.com/images/style/lw-header.png": null,
-"hqtubevideos.com/play.html": null,
-"take2.co.za/misc/bannerscript.php": null,
-"webopedia.com/img/header_icon_google.png": null,
-"orange.pl/ocp-http/map/js/cookies.js": null,
-"bbvms.com/zone/js/zonestats.js": null,
-"spankcdn.net/js/sw.ready.js": null,
-"scripts.snowball.com/scripts/images/pixy.gif": null,
-"hitleap.com/assets/banner.png": null,
-"digiland.it/count.cgi": null,
-"amazonaws.com/amacrpr/crpr.js": null,
-"oasisactive.com/pixels.cfm": null,
-"pornhost.com/count_hit_player.php": null,
-"impactloud.com/img/follow.png": null,
-"usersfiles.com/images/72890UF.png": null,
-"ubuntugeek.com/images/ubuntu1.png": null,
-"cloudfront.net/websites/sb.js": null,
-"forbesimg.com/assets/js/forbes/fast_pixel.js": null,
-"insidesources.com/wp-content/themes/insidesources/js/jquery.fancybox.js": null,
-"tinypic.com/track.php": null,
-"johnbridge.com/vbulletin/banner_rotate.js": null,
-"u.tv/utvplayer/everywhere/tracking.aspx": null,
-"imgbabes.com/element.js": null,
-"miragepics.com/images/11361497289209202613.jpg": null,
-"seaporn.org/scripts/life.js": null,
-"scoot.co.uk/ajax/log_serps.php": null,
-"amazonaws.com/g.aspx": null,
-"filepost.com/default_popup.html": null,
-"myfitnesspal.com/assets/mfp_localytics.js": null,
-"domainit.com/scripts/track.js": null,
-"alicdn.com/tkapi/click.js": null,
-"techbargains.com/scripts/banner.js": null,
-"ytn.co.kr/_comm/ylog.php": null,
-"domaintools.com/tracker.php": null,
-"zonecss.fr/images/statscreen.gif": null,
-"mediaset.it/cgi-bin/getcod.cgi": null,
-"thinkexist.com/images/afm.js": null,
-"ntmb.de/count.html": null,
-"experts-exchange.com/pageloaded.jsp": null,
-"jimstatic.com/ckies.js": null,
-"softcab.com/google.php": null,
-"socaseiras.com.br/banners.php": null,
-"aolcdn.com/js/mg2.js": null,
-"amazonaws.com/gaL.js": null,
-"app.cdn-cs.com/__t.png": null,
-"rtlradio.lu/stats.php": null,
-"accountnow.com/SyslogWriter.ashx": null,
-"onetravel.com/TrackOnetravelAds.js": null,
-"techbargains.com/inc_iframe_deals_feed.cfm": null,
-"azureedge.net/cdn/js/rad.js": null,
-"sendtonews.com/player/loggingajax.php": null,
-"rextube.com/plug/iframe.asp": null,
-"embedly.com/widgets/xcomm.html": null,
-"usfine.com/images/sty_img/usfine.gif": null,
-"xbooru.com/script/application.js": null,
-"runerich.com/images/sty_img/runerich.gif": null,
-"kontera.com/javascript/lib/KonaLibInline.js": null,
-"infogr.am/logger.php": null,
-"thesiteoueb.net/js/cm-head.js": null,
-"facebook.com/plugins/send.php": null,
-"facebook.com/plugins/recommendations_bar.php": null,
-"googleapis.com/aam.js": null,
-"googleapis.com/ivc.js": null,
-"yahoo.com/perf.gif": null,
-"bonbonme.com/js/rightbanner.js": null,
-"tortoise.proboards.com/tortoise.pl": null,
-"tapcdn.com/mosaic/tap_button.js": null,
-"comparestoreprices.co.uk/images/MMbg3.jpg": null,
-"facebook.com/xti.php": null,
-"honda.ca/_Global/js/includes/tracker.js": null,
-"infogr.am/js/metrics.js": null,
-"dj.rasset.ie/dotie/js/rte.ads.js": null,
-"retty.me/javascripts/common/logging.js": null,
-"d.yimg.com/ds/badge2.js": null,
-"redbunker.net/images/redb/redyeni.gif": null,
-"medscape.com/pi/1x1/pv/profreg-1x1.gif": null,
-"xbooru.com/gaming/clicker.php": null,
-"picturedip.com/windowfiles/dhtmlwindow.css": null,
-"vg247.com/wp-content/themes/vg247/scripts/mvg247-fsm.js": null,
-"textundblog.de/powercounter.js": null,
-"boersennews.de/js/lib/BnPageTracker.js": null,
-"amazonaws.com/ai-img/aia.js": null,
-"pornwikileaks.com/adultdvd.com.jpg": null,
-"myslavegirl.org/follow/go.js": null,
-"autosite.com/scripts/markerfile.bin": null,
-"wumii.com/images/pixel.png": null,
-"mealime.com/assets/mealytics.js": null,
-"tsphone.biz/pixelvoleur.jpg": null,
-"jav-porn.net/js/popup.js": null,
-"wal.co/cdn-perf.min.js": null,
-"naked-sluts.us/prpop.js": null,
-"giganews.com/images/rpp.gif": null,
-"playfooty.tv/jojo.html": null,
-"xogogo.com/images/latestpt.gif": null,
-"imgking.co/frler.js": null,
-"quotesonic.com/vendor/pixel.cfm": null,
-"video.msn.com/frauddetect.aspx": null,
-"vogue.co.uk/_/logic/statistics.js": null,
-"luobo.tv/staticts.html": null,
-"server4.pro/images/banner.jpg": null,
-"facebook.com/ct.php": null,
-"pbsrc.com/common/pixel.png": null,
-"teenpornvideo.xxx/tpv.js": null,
-"infochoice.com.au/Handler/WidgetV2Handler.ashx": null,
-"crackdb.com/img/vpn.png": null,
-"files-hawk.co.uk/hl/hawklinks.js": null,
-"uramov.info/wav/wavideo.html": null,
-"alex.leonard.ie/misc-images/transparent.png": null,
-"hdporn.net/images/hd-porn-banner.gif": null,
-"shopsubmit.co.uk/visitor.ashx": null,
-"eholidayfinder.com/images/logo.gif": null,
-"pourquoidocteur.fr/img2/face.png": null,
-"wellsfargo.com/AIDO/trx.js": null,
-"facebook.com/widgets/fan.php": null,
-"securepaynet.net/image.aspx": null,
-"imagefap.com/images/yes.gif": null,
-"wmtools.it/wmtcounter.php": null,
-"vkontakte.ru/widget_community.php": null,
-"wondershare.es/jslibs/track.js": null,
-"cloudfront.net/powr.js": null,
-"yahoodns.net/pixel.gif": null,
-"godaddy.com/js/gdwebbeacon.js": null,
-"stolenvideos.net/stolen.js": null,
-"amazonaws.com/skyscrpr.js": null,
-"linguee.fr/white_pixel.gif": null,
-"facebook.com/common/cavalry_endpoint.php": null,
-"xvideohost.com/hor_banner.php": null,
-"mathforum.org/images/tutor.gif": null,
-"clubic.com/editorial/publier_count.php": null,
-"paper.li/javascripts/analytics.js": null,
-"gstatic.com/gadf/ga_dyn.js": null,
-"mercola.com/Assets/js/omniture/sitecatalyst/mercola_s_code.js": null,
-"titan24.com/scripts/stats.js": null,
-"amazonaws.com/accio-lib/accip_script.js": null,
-"duowan.com/public/s/market_count.js": null,
-"twinsporn.net/images/delay.gif": null,
-"trainup.com/inc/TUPTracking.js": null,
-"nox.to/files/frame.htm": null,
-"annahar.com/assets/js/notifications.js": null,
-"mindwerk.net/zaehlpixel.php": null,
-"148.251.8.156/track.js": null,
-"javhub.net/img/r.jpg": null,
-"speedtest.dailymotion.com/latencies.js": null,
-"urlgalleries.net/cadsoverlay.php": null,
-"top.baidu.com/js/nsclick.js": null,
-"sextubebox.com/ab1.shtml": null,
-"sextubebox.com/ab2.shtml": null,
-"mygirlfriendvids.net/js/popall1.js": null,
-"military.com/cgi-bin/redlog2.cgi": null,
-"devilsfilm.com/track/go.php": null,
-"mytravel.co.uk/thomascooktrack.gif": null,
-"cloudfront.net/js/ca.js": null,
-"244pix.com/webop.jpg": null,
-"whoownsfacebook.com/images/topbanner.gif": null,
-"boards.ie/timing.php": null,
-"google.com/dssw.js": null,
-"justclicktowatch.to/jstp.js": null,
-"badjojo.com/js/tools.js": null,
-"libero.it/cgi-bin/cdcounter.cgi": null,
-"swiftypecdn.com/cc.js": null,
-"libero.it/cgi-bin/cdcountersp.cgi": null,
-"mozilla.com/js/track.js": null,
-"aniwatcher.com/xvideo.js": null,
-"infomarine.gr/images/banerr.gif": null };
-var bad_da_hostpath_exact_flag = 454 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 499 rules as an efficient NFA RegExp:
-var bad_da_hostpath_RegExp = /^(?:[\w-]+\.)*?(?:google\-analytics\.com\/plugins\/|googletagmanager\.com\/gtm\/|pinterest\.com\/images\/|pornfanplace\.com\/js\/pops\.|widgetserver\.com\/metrics\/|msn\.com\/tracker\/|sextronix\.com\/images\/|reddit\.com\/static\/|yahoo\.com\/track\/|r18\.com\/track\/|baidu\.com\/pixel|baidu\.com\/ecom|platform\.twitter\.com\/js\/button\.|adform\.net\/banners\/|chaturbate\.com\/affiliates\/|libs\.sphere\.com\/video\/outbrain\-player\/|adultfriendfinder\.com\/banners\/|dditscdn\.com\/log\/|facebook\.com\/plugins\/follow|google\.com\/analytics\/|propelplus\.com\/track\/|adf\.ly\/_|quantserve\.com\/pixel\/|torrentprotect\.com\/|view\.atdmt\.com\/partner\/|facebook\.com\/connect\/|netdna\-ssl\.com\/tracker\/|photobucket\.com\/track\/|doubleclick\.net\/pixel|imageshack\.us\/ads\/|yahoo\.com\/beacon\/|redtube\.com\/stats\/|amazonaws\.com\/analytics\.|jobthread\.com\/t\/|doubleclick\.net\/ad\/|cursecdn\.com\/banner\/|addthiscdn\.com\/live\/|google\-analytics\.com\/gtm\/js|4tube\.com\/iframe\/|facebook\.com\/tr|mediaplex\.com\/ad\/js\/|veeseo\.com\/tracking\/|twitter\.com\/javascripts\/|xvideos\-free\.com\/d\/|primevideo\.com\/uedata\/|facebook\.com\/plugins\/subscribe|exitintel\.com\/log\/|cloudfront\.net\/track|sailthru\.com\/img\/|siberiantimes\.com\/counter\/|xxxhdd\.com\/contents\/content_sources\/|imagecarry\.com\/down|facebook\.com\/plugins\/likebox\/|twitter\.com\/metrics|bing\.com\/widget\/render\/|adultfriendfinder\.com\/go\/|soundcloud\.com\/event|adultfriendfinder\.com\/javascript\/|pornoid\.com\/contents\/content_sources\/|fapality\.com\/contents\/content_sources\/|italiaonline\.it\/script\/ga\.|googlesyndication\.com\/sodar\/|googlesyndication\.com\/safeframe\/|dailymotion\.com\/track\-|dailymotion\.com\/track\/|turnsocial\.com\/track\/|github\.com\/_stats|conduit\.com\/\/banners\/|hstpnetwork\.com\/ads\/|youtube\.com\/pagead\/|extremetube\.com\/player_related|gamestar\.de\/_misc\/tracking\/|thrixxx\.com\/affiliates\/|pornalized\.com\/contents\/content_sources\/|pixazza\.com\/track\/|sysomos\.com\/track\/|luminate\.com\/track\/|picbucks\.com\/track\/|targetspot\.com\/track\/|wupload\.com\/referral\/|vindicosuite\.com\/track\/|xhamster\.com\/ads\/|theseforums\.com\/track\/|uploadgig\.com\/static\/|adroll\.com\/pixel\/|mixpanel\.com\/track|imagetwist\.com\/banner\/|wired\.com\/event|reevoo\.com\/track\/|topbucks\.com\/popunder\/|twitter\.com\/i\/jot|google\.com\/log|allanalpass\.com\/track\/|daylogs\.com\/counter\/|fastly\.net\/i|lovefilm\.com\/partners\/|porntube\.com\/adb\/|desipearl\.com\/tracker\/|shareaholic\.com\/analytics_|ad\.atdmt\.com\/e\/|vk\.com\/images\/|wtprn\.com\/sponsors\/|google\.com\/pagead\/|ad\.admitad\.com\/banner\/|static\.criteo\.com\/images[^\w.%-]|linkbucks\.com\/track\/|skysa\.com\/tracker\/|akanoo\.com\/tracker\/|apester\.com\/event[^\w.%-]|wellsfargo\.com\/tracking\/|appspot\.com\/stats|imdb\.com\/twilight\/|sourceforge\.net\/log\/|ru4\.com\/click|google\-analytics\.com\/collect|olark\.com\/track\/|merchenta\.com\/track\/|shareasale\.com\/image\/|sex\.com\/popunder\/|ad\.atdmt\.com\/m\/|photobox\.com\/event|americanexpress\.com\/beacon|soufun\.com\/stats\/|ad\.atdmt\.com\/i\/img\/|livedoor\.com\/counter\/|fulltiltpoker\.com\/affiliates\/|sparklit\.com\/counter\/|videowood\.tv\/pop|ad\.admitad\.com\/fbanner\/|sulia\.com\/papi\/sulia_partner\.js\/|static\.criteo\.net\/images[^\w.%-]|ad\.atdmt\.com\/s\/|cloudfront\.net\/twitter\/|theporncore\.com\/contents\/content_sources\/|recomendedsite\.com\/addon\/upixel\/|virool\.com\/widgets\/|tmall\.com\/add|amazonaws\.com\/fby\/|tumblr\.com\/pop\/js\/safeframe\-|spotify\.com\/follow\/|andyhoppe\.com\/count\/|purevpn\.com\/affiliates\/|youtube\.com\/get_midroll_|spacash\.com\/popup\/|cnzz\.com\/stat\.|red\-tube\.com\/popunder\/|appinthestore\.com\/click\/|filedownloader\.net\/design\/|wishlistproducts\.com\/affiliatetools\/|quora\.com\/_\/ad\/|bridgetrack\.com\/track\/|bluehost\-cdn\.com\/media\/partner\/images\/|pes\-patch\.com\/wp\-content\/uploads\/2019\/09\/buy\-pes20\-|vivatube\.com\/upload\/banners\/|phncdn\.com\/images\/banners\/|azureedge\.net\/track|quiz\.stroeermediabrands\.de\/pub\/|doubleclick\.net\/adx\/wn\.nat\.|betwaypartners\.com\/affiliate_media\/|static\.criteo\.net\/js\/duplo[^\w.%-]|upsellit\.com\/custom\/|sitegiant\.my\/affiliate\/|goldmoney\.com\/~\/media\/Images\/Banners\/|creativecdn\.com\/pix\/|4fcams\.com\/affiliates\/|tlavideo\.com\/affiliates\/|singlehop\.com\/affiliates\/|trrsf\.com\/metrics\/|viglink\.com\/api\/batch[^\w.%-]|drift\.com\/track|jenningsforddirect\.co\.uk\/sitewide\/extras\/|carbiz\.in\/affiliates\-and\-partners\/|artstation\.com\/p\/c_assets\/|inphonic\.com\/tracking\/|nspmotion\.com\/tracking\/|dealextreme\.com\/affiliate_upload\/|phncdn\.com\/iframe|talkers\.com\/images\/banners\/|carmag\.co\.za\/upload\/banners\/|internetbrands\.com\/partners\/|aliexpress\.com\/js\/beacon_|doubleclick\.net\/pfadx\/www\.tv3\.co\.nz|linkedin\.com\/img\/|ad2links\.com\/js\/|flixcart\.com\/affiliate\/|infibeam\.com\/affiliate\/|lawdepot\.com\/affiliate\/|seedsman\.com\/affiliate\/|couptopia\.com\/affiliate\/|aol\.com\/track\/|e\-tailwebstores\.com\/accounts\/default1\/banners\/|bruteforcesocialmedia\.com\/affiliates\/|foxadd\.com\/addon\/upixel\/|i\-tech\.com\.au\/media\/wysiwyg\/banner\/|media\.domainking\.ng\/media\/|youtube\.com\/api\/stats\/qoe|youtube\.com\/api\/stats\/delayplay|sk\-static\.com\/javascripts\/songkick\/analytics\/|wonderlabs\.com\/affiliate_pro\/banners\/|obox\-design\.com\/affiliate\-banners\/|bigrock\.in\/affiliate\/|russian\-dreams\.net\/static\/js\/|browsershots\.org\/static\/images\/creative\/|proxysolutions\.net\/affiliates\/|pwpwpoker\.com\/images\/banners\/|celebstoner\.com\/assets\/components\/bdlistings\/uploads\/|h2porn\.com\/contents\/content_sources\/|reallifecam\.com\/track\/|trustpilot\.com\/stats\/|share\-online\.biz\/affiliate\/|theseblogs\.com\/visitScript\/|leadsleap\.com\/images\/banner_|nelonenmedia\.fi\/hitcounter|koreatimes\.co\.kr\/ad\/|t5\.ro\/static\/|aftonbladet\.se\/blogportal\/view\/statistics|vimeocdn\.com\/add\/player\-stats|celebstoner\.com\/assets\/images\/img\/sidebar\/|ebaystatic\.com\/aw\/signin\/ebay\-signin\-toyota\-|evilangel\.com\/static\/|amazonaws\.com\/photos\.offers\.analoganalytics\.com\/|googlesyndication\.com\/pagead\/|dailymail\.co\.uk\/tracking\/|questionmarket\.com\/static\/|techkeels\.com\/creatives\/|ctctcdn\.com\/js\/signup\-form\-widget\/|googlesyndication\.com\/simgad\/|cloudfront\.net\/facebook\/|hottubeclips\.com\/stxt\/banners\/|jobs\-affiliates\.ws\/images\/|s3\.amazonaws\.com\/draftset\/banners\/|engadget\.com\/click|premiumtradings\.com\/media\/images\/index_banners\/|clickandgo\.com\/booking\-form\-widget|tshirthell\.com\/img\/affiliate_section\/|yahooapis\.com\/get\/Valueclick\/CapAnywhere\.getAnnotationCallback|expekt\.com\/affiliates\/|swurve\.com\/affiliates\/|axandra\.com\/affiliates\/|graboid\.com\/affiliates\/|visa\.com\/logging\/logEvent|blissful\-sin\.com\/affiliates\/|singlemuslim\.com\/affiliates\/|bruteforceseo\.com\/affiliates\/|graduateinjapan\.com\/affiliates\/|zanox\-affiliate\.de\/ppv\/|doubleclick\.net\/N2\/pfadx\/video\.wsj\.com\/|media\.enimgs\.net\/brand\/files\/escalatenetwork\/|nudography\.com\/photos\/banners\/|ppc\-coach\.com\/jamaffiliates\/|flipkart\.com\/ajaxlog\/visitIdlog|punterlink\.co\.uk\/images\/storage\/siteban|vpnarea\.com\/affiliate\/|thelodownny\.com\/leslog\/ads\/|borrowlenses\.com\/affiliate\/|thereadystore\.com\/affiliate\/|totallylayouts\.com\/online\-users\-counter\/|accuradio\.com\/static\/track\/|onecount\.net\/onecount\/oc_track\/|getadblock\.com\/images\/adblock_banners\/|supplyframe\.com\/partner\/|tsite\.jp\/static\/analytics\/|condenastdigital\.com\/track|golem\.de\/staticrl\/scripts\/golem_cpxl_|aerotime\.aero\/upload\/banner\/|wwe\.com\/sites\/all\/modules\/wwe\/wwe_analytics\/|facebook\.com\/method\/links\.getStats|hirepurpose\.com\/static\/widgets\/|adm24\.de\/hp_counter\/|lipsy\.co\.uk\/_assets\/images\/skin\/tracking\/|hearstapps\.com\/static\/moat\.|amazonaws\.com\/statics\.reedge\.com\/|shinypics\.com\/blogbanner\/|livefyre\.com\/tracking\/|viglink\.com\/api\/insert[^\w.%-]|download\.bitdefender\.com\/resources\/media\/|letsupload\.co\/themes\/mngez\/mngez\/images\/apollo\.webp|letsupload\.co\/themes\/mngez\/mngez\/images\/repack\.webp|sextvx\.com\/static\/images\/tpd\-|vindicosuite\.com\/tracking\/|lumfile\.com\/lumimage\/ourbanner\/|carmag\.co\.za\/upload\/dmx_banners\/|mightydeals\.s3\.amazonaws\.com\/md_adv\/|rabble\.ca\/sites\/default\/files\/styles\/partners_|coursehero\.com\/v1\/data\-tracking|adyou\.me\/bug\/adcash|amazonaws\.com\/streetpulse\/ads\/|thejewishvoice\.com\/wp\-content\/uploads\/book\-yf\/|vipstatic\.com\/mars\/|draugiem\.lv\/lapas\/widgets\/|bwwstatic\.com\/socialtop|ziffstatic\.com\/jst\/zdvtools\.|xcritic\.com\/images\/buy\-|cinemablend\.com\/static\/js\/k2\/|cinemablend\.com\/static\/js\/batsignal\/|alwaght\.com\/upload\/logo\/case\/|safarinow\.com\/affiliate\-zone\/|avira\.com\/site\/datatracking|inhumanity\.com\/cdn\/affiliates\/|go2cdn\.org\/brand\/|presscoders\.com\/wp\-content\/uploads\/misc\/aff\/|apple\.com\/itunesaffiliates\/|getnzb\.com\/img\/partner\/banners\/|porn\.com\/assets\/partner_|tonefuse\.s3\.amazonaws\.com\/clientjs\/|mshcdn\.com\/assets\/metrics\-|google\-analytics\.com\/internal\/collect[^\w.%-]|mp\.weixin\.qq\.com\/mp\/getappmsgad|ball2win\.com\/Affiliate\/|sfstatic\.net\/build\/experiment\/helperWidget\-|wykop\.pl\/dataprovider\/diggerwidget\/|doubleclick\.net\/adx\/wn\.loc\.|porn\.com\/737cdn189\/|innogamescdn\.com\/media\/js\/metrics\-|yandex\.fr\/clck\/click|porn\.com\/189media737\/|viralize\.tv\/track\/|virtualhottie2\.com\/cash\/tools\/banners\/|linkedin\.com\/countserv\/count\/|amazon\.com\/clog\/|go\.com\/stat\/|moneycontrol\.com\/share\-market\-game\/|linkedin\.com\/countserv\/|filepost\.com\/static\/images\/bn\/|franceculture\.fr\/static\/js\/xtcore\-|ziffstatic\.com\/jst\/zdsticky\.|lagacetanewspaper\.com\/wp\-content\/uploads\/banners\/|lowendbox\.com\/wp\-content\/themes\/leb\/banners\/|youtube\-nocookie\.com\/api\/stats\/playback|mail\.ru\/counter|a\.huluad\.com\/beacons\/|examiner\.com\/sites\/all\/modules\/custom\/ex_stats\/|sweed\.to\/affiliates\/|qcloud\.com\/report\.go|knco\.com\/wp\-content\/uploads\/wpt\/|treato\.com\/api\/analytics|salemwebnetwork\.com\/Stations\/images\/SiteWrapper\/|moneywise\.co\.uk\/affiliate\/|sitebooster\.com\/sb\/wix\/p|amazonaws\.com\/btrb\-prd\-banners\/|debtconsolidationcare\.com\/affiliate\/tracker\/|googlesyndication\.com\/ima3vpaid|fairfaxregional\.com\.au\/proxy\/commercial\-partner\-solar\/|googletagservices\.com\/tag\/static\/|tourradar\.com\/def\/partner|stats\.t\-online\.de\/include\-ivw\-agof\-szmng\-js\/|yimg\.com\/uq\/syndication\/|oasap\.com\/images\/affiliate\/|hostdime\.com\/images\/affiliate\/|driverdb\.com\/assets\/img\/banners\/|urbanlist\.com\/event\/track\-first\-view\/|liveperson\.com\/affiliates\/|p\.jwpcdn\.com\/player\/plugins\/vast\/|themesltd\.com\/online\-users\-counter\/|chaturbate\.com\/sitestats\/openwindow\/|pixel\.indieclicktv\.com\/annonymous\/|amazon\.com\/gp\/yourstore\/recs\/|express\.de\/analytics\/|homoactive\.tv\/banner\/|brandrepublic\.com\/session\-img\/|camwhores\.tv\/banners\/|autotrader\.co\.za\/partners\/|youronlinechoices\.com\/activity\/|desperateseller\.co\.uk\/affiliates\/|googlesyndication\.com\/sadbundle\/|doubleclick\.net\/xbbe\/creative\/vast|metroweekly\.com\/tools\/blog_add_visitor\/|camvideos\.tv\/tpd\.|yyv\.co\/track\/|armenpress\.am\/static\/add\/|bangyoulater\.com\/images\/banners_|pcmall\.co\.za\/affiliates\/|dday\.it\/assets\/img\/cds_logo\-|ypcdn\.com\/webyp\/javascripts\/client_side_analytics_|doubleclick\.net\/N5202\/pfadx\/cmn_livemixtapes\/|wieistmeineip\.de\/ip\-address\/|tottenhamhotspur\.com\/media\/javascript\/google\/|oodle\.co\.uk\/event\/track\-first\-view\/|rbth\.ru\/widget\/|flipkart\.com\/affiliateWidget\/|thedailyherald\.sx\/images\/banners\/|altushost\.com\/docs\/|citygridmedia\.com\/ads\/|yporn\.tv\/uploads\/flv_player\/commercials\/|assfuck\.xxx\/uploads\/provider\-banners\/|foxtel\.com\.au\/cms\/fragments\/corp_analytics\/|bloodstock\.uk\.com\/affiliates\/|vipfile\.cc\/images\/|brandcdn\.com\/pixel\/|assfuck\.xxx\/uploads\/banners\/|twitter\.com\/scribes\/|stomp\.com\.sg\/site\/servlet\/tracker|doubleclick\.net\/adx\/tsg\.|yimg\.com\/nq\/ued\/assets\/flash\/wsclient_|cfcdn\.com\/showcase_sample\/search_widget\/|sfimg\.com\/images\/banners\/|timesinternet\.in\/ad\/|lingows\.appspot\.com\/page_data\/|flipboard\.com\/web\/buttons\/|afr\.com\/assets\/europa\.|free\-filehost\.net\/pop\/|mybdhost\.com\/imgv2\/|newton\.pm\/events\/track_bulk|gamefront\.com\/wp\-content\/plugins\/tracker\/|videobolt\.net\/api\/log|mcclatchyinteractive\.com\/creative\/|channel4\.com\/ad\/|bpath\.com\/affiliates\/|mol\.im\/i\/pix\/ebay\/|snapkit\.com\/v1\/sdk\/metrics\/|fulhamfc\.com\/i\/partner\/|mail\.ru\/count\/|youtube\-nocookie\.com\/ptracking|indiatimes\.com\/stats|bharatmatrimony\.com\/matrimoney\/matrimoneybanners\/|digitalsatellite\.tv\/banners\/|chefkoch\.de\/counter|kitz\.co\.uk\/files\/jump2\/|clipsyndicate\.com\/cs_api\/cliplog|f\-picture\.net\/Misc\/JumpClick|mailjet\.com\/widget\/|hostsearch\.com\/creative\/|sobeycloud\.com\/Services\/Stat\.|apkmaza\.net\/wp\-content\/uploads\/|cactusvpn\.com\/images\/affiliates\/|drugs\.com\/api\/logger\/|theolivepress\.es\/cdn\-cgi\/cl\/|babyblog\.ru\/pixel|fleshbot\.com\/wp\-content\/themes\/fbdesktop_aff\/images\/af|sportpesanews\.com\/images\/promo\/|sexyfuckgames\.com\/images\/promo\/|wetpussygames\.com\/images\/promo\/|usps\.com\/survey\/|hornygamer\.com\/images\/promo\/|attn\.com\/survey|tmbattle\.com\/images\/promo_|brettterpstra\.com\/wp\-content\/uploads\/|porn2blog\.com\/wp\-content\/banners\/|cloudfunctions\.net\/function\-record\-stream\-metric|thrillist\.com\/track|rakuten\-static\.com\/com\/rat\/|ab\-in\-den\-urlaub\.de\/usertracking\/|att\.com\/scripts\/satellite\/prod\/|govevents\.com\/display\-file\/|planetlotus\.org\/images\/partners\/|mrskin\.com\/affiliateframe\/|indochino\.com\/indo\-ecapture\-widget\/|2adultflashgames\.com\/play_more_adult_games\/|buyselltrade\.ca\/banners\/|youtube\.com\/api\/stats\/atr|draugiem\.lv\/business\/ext\/fans\/|shariahprogram\.ca\/banners\/|remixshop\.com\/bg\/site\/ajaxCheckCookiePolicy|exwp\.org\/partners\/|devatube\.com\/img\/partners\/|cartoonnetwork\.com\/tools\/js\/clickmap\/|applifier\.com\/users\/tracking|doubleclick\.net\/pfadx\/ng\.videoplayer\/|pussycash\.com\/content\/banners\/|webring\.com\/cgi\-bin\/logit|service\-webmaster\.fr\/cpt\-visites\/|userscloud\.com\/images\/banners\/|doubleclick\.net\/adx\/CBS\.|interserver\.net\/logos\/vps\-|ednetz\.de\/api\/public\/socialmediacounter\.|calciomercato\.it\/img\/notizie\/social\/|sendit\.cloud\/images\/banner\/|glamour\.cz\/banners\/|schwalbe\.co\.uk\/_webedit\/cached\-images\/172\-37\-38\-0\-0\-37\-38|schwalbe\.co\.uk\/_webedit\/cached\-images\/174\-37\-38\-0\-0\-37\-38|onescreen\.net\/os\/static\/pixels\/|bluenile\.ca\/track\/|groupon\.com\/tracking|crdclub\.cc\/banners\/|golem\.de\/staticrl\/scripts\/golem_cpx_|smbulk\.com\/assets\/images\/banner\-|daily\-sun\.com\/assets\/images\/banner\/|theindependentbd\.com\/assets\/images\/banner\/|amazonaws\.com\/ownlocal\-|l\-host\.net\/etn\/omnilog|static\.criteo\.net\/design[^\w.%-]|matureworld\.ws\/images\/banners\/|espreso\.rs\/widget|ksstradio\.com\/wp\-content\/banners\/|torrentfreak\.com\/wp\-content\/banners\/|escapementmagazine\.com\/wp\-content\/banners\/|huuto\.net\/js\/analytic\/|vigrax\.pl\/banner\/|tube18\.sex\/tube18\.|pmo\.ee\/stats\/|civicscience\.com\/widget\/jspoll\/|citeulike\.org\/static\/campaigns\/|kshp\.com\/uploads\/banners\/|whistleout\.com\/Widgets\/|itweb\.co\.za\/sponsored_|mediamanager\.co\.za\/img\/banners\/|thesaurus\.com\/track\/|hotpads\.com\/node\/api\/comscore|creaweb\.it\/cookie\/)/i;
-var bad_da_hostpath_regex_flag = 499 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 152 rules as an efficient NFA RegExp:
-var bad_da_RegExp = /^(?:[\w-]+\.)*?(?:porntube\.com\/ads$|ads\.|adv\.|erotikdeal\.com\/\?ref=|quantserve\.com\/pixel;|banners\.|banner\.|affiliate\.|affiliates\.|api\-read\.facebook\.com\/restserver\.php\?api_key=|synad\.|yahoo\.com\/p\.gif;|taboola\.com\/\?uid=|d1z2jf7jlzjs58\.cloudfront\.net[^\w.%-]\$rewrite=abp\-resource\:blank\-js,domain=voici\.fr|ad\.atdmt\.com\/i\/go;|tube911\.com\/scj\/cgi\/out\.php\?scheme_id=|graph\.facebook\.com\/fql\?q=SELECT|movies\.askjolene\.com\/c64\?clickid=|qualtrics\.com\/WRSiteInterceptEngine\/\?Q_Impress=|ipornia\.com\/scj\/cgi\/out\.php\?scheme_id=|monova\.to[^\w.%-]\$csp=script\-src 'self' 'unsafe\-inline'|shawmediaauto\.com\/event\/i\/\?size=|voxmedia\.com\/needle\?d=|google\.com\/_\/\+1\/|api\.ticketnetwork\.com\/Events\/TopSelling\/domain=nytimes\.com|sponsorselect\.com\/Common\/LandingPage\.aspx\?eu=|oddschecker\.com\/clickout\.htm\?type=takeover\-|sweed\.to\/\?pid=|google\.com\/uds\/\?file=orkut&|moosify\.com\/widgets\/explorer\/\?partner=|eurolive\.com\/index\.php\?module=public_eurolive_onlinetool&|affiliates2\.|inn\.co\.il\/Controls\/HPJS\.ashx\?act=log|plista\.com\/jsmodule\/flash$|plista\.com\/async\/min\/video,outstream\/|ab\-in\-den\-urlaub\.de\/resources\/cjs\/\?f=\/resources\/cjs\/tracking\/|eurolive\.com\/\?module=public_eurolive_onlinehostess&|ceros\.com\/a\?data|vpnfortorrents\.org\/\?id=|yahoo\.com\/yi\?bv=|sheknows\.com\/api\/module\?id=follow_social|toolbox\.com\/DataLayerPixelServlet$|yahoo\.com\/serv\?s|rehost\.to\/\?ref=|augine\.com\/widget$|seatplans\.com\/widget$|urmediazone\.com\/play\?ref=|777livecams\.com\/\?id=|amazonaws\.com\/\?wsid=|jewsnews\.co\.il[^\w.%-]\$csp=script\-src 'self' |alibi\.com\/\?request_type=aimg|monova\.org[^\w.%-]\$csp=script\-src 'self' 'unsafe\-inline'|k7\-labelgroup\.com\/g\.html\?uid=|irs01\.|xhamster\.com\/ajax\.php\?act=track_event|fancybar\.net\/ac\/fancybar\.js\?zoneid|ws\.amazon\.com\/widgets\/(?=([\s\S]*?=gettrackingid$))\1|t\-online\.de[^\w.%-](?=([\s\S]*?\/noresult\.js\?track=))\2|photobucket\.com[^\w.%-](?=([\s\S]*?\/api\.php\?))\3(?=([\s\S]*?&method=track&))\4|casino\-x\.com[^\w.%-](?=([\s\S]*?\?partner=))\5|ad\.atdmt\.com\/i\/(?=([\s\S]*?=))\6|flirt4free\.com[^\w.%-](?=([\s\S]*?&utm_campaign))\7|pornsharing\.com[^\w.%-]\$csp=script\-src 'self' 'unsafe\-inline' 'unsafe\-eval' data\: (?=([\s\S]*?\.google\.com ))\8(?=([\s\S]*?\.gstatic\.com ))\9(?=([\s\S]*?\.google\-analytics\.com))\10|9to5google\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.ytimg\.com ))\11(?=([\s\S]*?\.youtube\.com ))\12(?=([\s\S]*?\.google\.com ))\13(?=([\s\S]*?\.disqus\.com ))\14(?=([\s\S]*?\.disquscdn\.com))\15|electrek\.co[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.ytimg\.com ))\16(?=([\s\S]*?\.youtube\.com ))\17(?=([\s\S]*?\.google\.com ))\18(?=([\s\S]*?\.disqus\.com ))\19(?=([\s\S]*?\.disquscdn\.com))\20|9to5mac\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.ytimg\.com ))\21(?=([\s\S]*?\.youtube\.com ))\22(?=([\s\S]*?\.google\.com ))\23(?=([\s\S]*?\.disqus\.com ))\24(?=([\s\S]*?\.disquscdn\.com))\25|dronedj\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.ytimg\.com ))\26(?=([\s\S]*?\.youtube\.com ))\27(?=([\s\S]*?\.google\.com ))\28(?=([\s\S]*?\.disqus\.com ))\29(?=([\s\S]*?\.disquscdn\.com))\30|9to5toys\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.ytimg\.com ))\31(?=([\s\S]*?\.youtube\.com ))\32(?=([\s\S]*?\.google\.com ))\33(?=([\s\S]*?\.disqus\.com ))\34(?=([\s\S]*?\.disquscdn\.com))\35|healthline\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? 'unsafe\-inline'))\36|marketrealist\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.ytimg\.com ))\37(?=([\s\S]*?\.youtube\.com ))\38(?=([\s\S]*?\.google\.com ))\39(?=([\s\S]*?\.disqus\.com ))\40(?=([\s\S]*?\.disquscdn\.com))\41|iyfsearch\.com[^\w.%-](?=([\s\S]*?&pid=))\42|bittorrentstart\.com[^\w.%-]\$csp=script\-src 'self' 'unsafe\-inline' data\: (?=([\s\S]*?\.google\.com ))\43(?=([\s\S]*?\.google\-analytics\.com ))\44(?=([\s\S]*?\.scorecardresearch\.com))\45|media\.campartner\.com\/index\.php\?cpID=(?=([\s\S]*?&cpMID=))\46|widgets\.itunes\.apple\.com[^\w.%-](?=([\s\S]*?&affiliate_id=))\47|freehostedscripts\.net[^\w.%-](?=([\s\S]*?\.php\?site=))\48(?=([\s\S]*?&s=))\49(?=([\s\S]*?&h=))\50|duckduckgo\.com\/m\.js\?(?=([\s\S]*?[^\w.%-]cb=ddg_spice_amazon[^\w.%-]))\51|facebook\.com\/restserver\.php\?(?=([\s\S]*?\.getStats&))\52|hop\.clickbank\.net\/(?=([\s\S]*?&transaction_id=))\53(?=([\s\S]*?&offer_id=))\54|tipico\.(?=([\s\S]*?\?affiliateId=))\55|facebook\.com\/(?=([\s\S]*?\/plugins\/send_to_messenger\.php\?app_id=))\56|eztv\.io[^\w.%-]\$csp=script\-src 'self' 'unsafe\-inline' (?=([\s\S]*?\.cloudflare\.com ))\57(?=([\s\S]*?\.googleapis\.com ))\58(?=([\s\S]*?\.facebook\.net))\59|uptobox\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? 'unsafe\-inline' ))\60(?=([\s\S]*?\.gstatic\.com ))\61(?=([\s\S]*?\.google\.com ))\62(?=([\s\S]*?\.googleapis\.com))\63|tipico\.com[^\w.%-](?=([\s\S]*?\?affiliateid=))\64|gelbooru\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? 'unsafe\-inline' ))\65(?=([\s\S]*?\.gstatic\.com ))\66(?=([\s\S]*?\.google\.com ))\67(?=([\s\S]*?\.googleapis\.com ))\68(?=([\s\S]*?\.bootstrapcdn\.com))\69|cts\.tradepub\.com\/cts4\/\?ptnr=(?=([\s\S]*?&tm=))\70|americasfreedomfighters\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.leadpages\.net ))\71(?=([\s\S]*?\.gstatic\.com ))\72(?=([\s\S]*?\.google\.com ))\73(?=([\s\S]*?\.googleapis\.com ))\74(?=([\s\S]*?\.playwire\.com ))\75(?=([\s\S]*?\.facebook\.com ))\76(?=([\s\S]*?\.bootstrapcdn\.com))\77|comicallyincorrect\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.leadpages\.net ))\78(?=([\s\S]*?\.gstatic\.com ))\79(?=([\s\S]*?\.google\.com ))\80(?=([\s\S]*?\.googleapis\.com ))\81(?=([\s\S]*?\.playwire\.com ))\82(?=([\s\S]*?\.facebook\.com ))\83(?=([\s\S]*?\.bootstrapcdn\.com))\84|allthingsvegas\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.leadpages\.net ))\85(?=([\s\S]*?\.gstatic\.com ))\86(?=([\s\S]*?\.google\.com ))\87(?=([\s\S]*?\.googleapis\.com ))\88(?=([\s\S]*?\.playwire\.com ))\89(?=([\s\S]*?\.facebook\.com ))\90(?=([\s\S]*?\.bootstrapcdn\.com))\91|survivalnation\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.leadpages\.net ))\92(?=([\s\S]*?\.gstatic\.com ))\93(?=([\s\S]*?\.google\.com ))\94(?=([\s\S]*?\.googleapis\.com ))\95(?=([\s\S]*?\.playwire\.com ))\96(?=([\s\S]*?\.facebook\.com ))\97(?=([\s\S]*?\.bootstrapcdn\.com))\98|thehayride\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.leadpages\.net ))\99(?=([\s\S]*?\.gstatic\.com ))\100(?=([\s\S]*?\.google\.com ))\101(?=([\s\S]*?\.googleapis\.com ))\102(?=([\s\S]*?\.playwire\.com ))\103(?=([\s\S]*?\.facebook\.com ))\104(?=([\s\S]*?\.bootstrapcdn\.com))\105|computerarts\.co\.uk\/(?=([\s\S]*?\.php\?cmd=site\-stats))\106|hostmonster\.com[^\w.%-](?=([\s\S]*?&utm_))\107|fantasti\.cc[^\w.%-](?=([\s\S]*?\?ad=))\108|plarium\.com\/play\/(?=([\s\S]*?adCampaign=))\109|online\.mydirtyhobby\.com[^\w.%-](?=([\s\S]*?\?naff=))\110|cheatsheet\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.leadpages\.net ))\111(?=([\s\S]*?\.gstatic\.com ))\112(?=([\s\S]*?\.google\.com ))\113(?=([\s\S]*?\.googleapis\.com ))\114(?=([\s\S]*?\.playwire\.com ))\115(?=([\s\S]*?\.facebook\.com ))\116(?=([\s\S]*?\.bootstrapcdn\.com ))\117(?=([\s\S]*?\.twitter\.com ))\118(?=([\s\S]*?\.spot\.im))\119|facebook\.com\/connect\/connect\.php\?(?=([\s\S]*?width))\120(?=([\s\S]*?&height))\121|mjtlive\.com\/exports\/golive\/\?lp=(?=([\s\S]*?&afno=))\122|bulletsfirst\.net[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*?\.leadpages\.net ))\123(?=([\s\S]*?\.gstatic\.com ))\124(?=([\s\S]*?\.google\.com ))\125(?=([\s\S]*?\.googleapis\.com ))\126(?=([\s\S]*?\.playwire\.com ))\127(?=([\s\S]*?\.facebook\.com ))\128(?=([\s\S]*?\.bootstrapcdn\.com))\129|get\.(?=([\s\S]*?\.website\/static\/get\-js\?stid=))\130|skyscanner\.(?=([\s\S]*?\/slipstream\/applog$))\131|shopify\.com\/(?=([\s\S]*?\/page\?))\132(?=([\s\S]*?&eventType=))\133|miniurls\.co[^\w.%-](?=([\s\S]*?\?ref=))\134|netflix\.com\/beacons\?(?=([\s\S]*?&ssizeCat=))\135(?=([\s\S]*?&vsizeCat=))\136|pornhub\.com[^\w.%-](?=([\s\S]*?&utm_campaign=))\137(?=([\s\S]*?\-pop$))\138|assoc\-amazon\.(?=([\s\S]*?[^\w.%-]e\/ir\?t=))\139|media\.campartner\.com[^\w.%-](?=([\s\S]*?\?cp=))\140|r\.ypcdn\.com[^\w.%-](?=([\s\S]*?\/rtd\?ptid))\141|yimg\.com[^\w.%-](?=([\s\S]*?\/l\?ig=))\142|freebeacon\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? blob\: data\:))\143|liveperson\.net\/hc\/(?=([\s\S]*?\/\?visitor=))\144|c\.ypcdn\.com[^\w.%-](?=([\s\S]*?\/webyp\?rid=))\145|convertcase\.net[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? blob\: data\:))\146|downloadprovider\.me\/en\/search\/(?=([\s\S]*?\?aff\.id=))\147(?=([\s\S]*?&iframe=))\148|socialreader\.com[^\w.%-](?=([\s\S]*?\?event=email_open[^\w.%-]))\149|clickbank\.net\/(?=([\s\S]*?offer_id=))\150|licdn\.com\/(?=([\s\S]*?\.gif\?rnd=))\151|c\.ypcdn\.com[^\w.%-](?=([\s\S]*?&ptid))\152|c\.ypcdn\.com[^\w.%-](?=([\s\S]*?\?ptid))\153|vidstreamup\.com[^\w.%-]\$csp=script\-src (?=([\s\S]*? 'unsafe\-inline' blob\:))\154|speedtestbeta\.com\/(?=([\s\S]*?\.gif\?cb))\155|ebayobjects\.com\/(?=([\s\S]*?;dc_pixel_url=))\156|freean\.us[^\w.%-](?=([\s\S]*?\?ref=))\157|amazon\.(?=([\s\S]*?\/batch\/))\158(?=([\s\S]*?uedata=))\159|everestpoker\.com[^\w.%-](?=([\s\S]*?\/\?adv=))\160|cyberprotection\.pro[^\w.%-](?=([\s\S]*?\?aff))\161|torrentz\.eu\/search(?=([\s\S]*?=))\162|amazonaws\.com\/betpawa\-(?=([\s\S]*?\.html\?aff=))\163|tamilo\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? blob\: data\:))\164|lucianne\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? blob\: data\:))\165|allthetests\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? blob\: data\:))\166|hiphoplately\.com[^\w.%-]\$csp=script\-src 'self' (?=([\s\S]*? blob\: data\:))\167|amazonaws\.com[^\w.%-](?=([\s\S]*?=avnts_error))\168|skyscanner\.(?=([\s\S]*?\/slipstream\/view$))\169|btkitty\.pet[^\w.%-]\$csp=script\-src 'self' 'unsafe\-inline' (?=([\s\S]*?\.cloudflare\.com ))\170(?=([\s\S]*?\.googleapis\.com ))\171(?=([\s\S]*?\.jsdelivr\.net))\172|imagepix\.okoshechka\.net[^\w.%-](?=([\s\S]*?\/\?sid=))\173|activistpost\.com[^\w.%-]\$csp=script\-src (?=([\s\S]*?\.leadpages\.net ))\174(?=([\s\S]*?\.gstatic\.com ))\175(?=([\s\S]*?\.google\.com ))\176(?=([\s\S]*?\.googleapis\.com ))\177(?=([\s\S]*?\.playwire\.com ))\178(?=([\s\S]*?\.facebook\.com ))\179(?=([\s\S]*?\.bootstrapcdn\.com))\180|manager\-magazin\.de\/js\/http\/(?=([\s\S]*?,testat_))\181|soundcloud\.com[^\w.%-](?=([\s\S]*?\/plays\?referer=))\182|amazon\.com\/\?_encoding(?=([\s\S]*?&linkcode))\183|lijit\.com\/blog_wijits\?(?=([\s\S]*?=trakr&))\184|metaffiliation\.com[^\w.%-](?=([\s\S]*?[^\w.%-]maff=))\185|metaffiliation\.com[^\w.%-](?=([\s\S]*?[^\w.%-]taff=))\186|metaffiliation\.com[^\w.%-](?=([\s\S]*?[^\w.%-]mclic=))\187|uploadrocket\.net\/downloadfiles\.php\?(?=([\s\S]*?&ip))\188|lovepoker\.de[^\w.%-](?=([\s\S]*?\/\?pid=))\189|apis\.google\.com\/_\/scs\/apps\-static\/(?=([\s\S]*?=page,plusone\/))\190|mmo4rpg\.com[^\w.%-](?=([\s\S]*?\.gif$))\191|plista\.com\/widgetdata\.php\?(?=([\s\S]*?%22pictureads%22%7D))\192|amazon\.com\/gp\/(?=([\s\S]*?&linkCode))\193|realstylenetwork\.com\/celebrities\/(?=([\s\S]*?&action=inc_popup))\194|oas\.(?=([\s\S]*?@))\195)/i;
-var bad_da_regex_flag = 152 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 0 rules as an efficient NFA RegExp:
-var good_url_parts_RegExp = /^$/;
-var good_url_parts_flag = 0 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 499 rules as an efficient NFA RegExp:
-var bad_url_parts_RegExp = /(?:\/adsys\/|\/pp\-ad\.|\/adserver\.|\/popad$|\.online\/ads\/|\/online\/ads\/|\.com\/ads\?|\.com\/\?adv=|\/img\/adv\.|\/img\/adv\/|\/expandable_ad\?|\/homepage\-ads\/|\/homepage\/ads\/|\/ad\-engine\.|\/ad_engine\?|\.com\/js\/ads\/|\-web\-ad\-|\/web\-ad_|\-leaderboard\-ad\-|\/leaderboard_ad\.|\/leaderboard_ad\/|\/iframead\.|\/iframead\/|\/contentad\/|\/contentad$|\-ad\-content\/|\/ad\/content\/|\/ad_content\.|\/ad\-image\.|\/ad\/image\/|\/ad_image\.|\/ad\-images\/|\/ad\/images\/|\/ad_images\/|\/adcontent\/|\/webad\?|_webad\.|\/imgad\-|\/imgad\.|\/imgad\?|\/adplugin\.|\/adplugin\/|\/adplugin_|\-iframe\-ad\.|\/iframe\-ad\.|\/iframe\-ad\/|\/iframe\-ad\?|\/iframe\.ad\/|\/iframe\/ad\/|\/iframe\/ad_|\/iframe_ad\.|\/iframe_ad\?|\-content\-ad\-|\-content\-ad\.|\/content\/ad\/|\/content\/ad_|\/content_ad\.|_content_ad\.|\/video\-ad\.|\/video\/ad\/|\/video_ad\.|\-ad_leaderboard\/|\/ad\-leaderboard\.|\/ad\/leaderboard\.|\/ad_leaderboard\.|\/ad_leaderboard\/|=ad\-leaderboard\-|\/_img\/ad_|\/img\/_ad\.|\/img\/ad\-|\/img\/ad\.|\/img\/ad\/|\/img_ad\/|\.com\/video\-ad\-|\/aff_ad\?|\/video\-js\-ads\.|\/showads\/|=ad_unit&|\-ad\-iframe\.|\-ad\-iframe\/|\-ad\/iframe\/|\/ad\-iframe\-|\/ad\-iframe\.|\/ad\-iframe\?|\/ad\/iframe\.|\/ad\/iframe\/|\/ad\?iframe_|\/ad_iframe\.|\/ad_iframe_|=ad_iframe&|=ad_iframe_|\/bottom\-ads\.|\/ad132m\/|\/special\-ads\/|\/post\/ads\/|\/adclick\.|\/sharetools\/|\/footer\-ads\/|\/bg\/ads\/|\/player\/ads\.|\/player\/ads\/|\/bin\/stats\?|\/sticky\-ads\-|\.co\/ads\/|\-show\-ads\.|\/show\-ads\.|\-text\-ads\.|\/ad\.php$|\/expandable_ad\.php|\/ad_pop\.php\?|\-iframe\-ads\/|\/iframe\-ads\/|\/iframe\/ads\/|\-ads\-iframe\.|\/ads\/iframe|\/ads_iframe\.|\-top\-ads\.|\/top\-ads\.|\/ad\?count=|\/ad_count\.|\/afs\/ads\/|\/concert\-ads\/|\/ad\/logo\/|\/modules\/ads\/|\/js\/ads_|\/vast\/ads\-|\/dynamic\/ads\/|\/click\?adv=|\/mobile\-ads\/|\-article\-ads\-|\/ad\?sponsor=|\/side\-ads\-|\/responsive\-ads\.|\/cms\/ads\/|\/ads\.cms|\/custom\/ads|_track\/ad\/|\/ads\/html\/|&program=revshare&|\/external\/ads\/|\/ads_php\/|\/i\/ads\/|\.no\/ads\/|\/ads12\.|\-adskin\.|\/adskin\/|\/ext\/ads\/|\-video\-ads\/|\/video\-ads\/|\/video\.ads\.|\/video\/ads\/|\/adsetup\.|\/adsetup_|\/adsframe\.|\/adsdaq_|\/popupads\.|\/left\-ads\.|\/user\/ads\?|\/inc\/ads\/|\/icon\/share\-|\/sidebar\-ads\/|\/default\/ads\/|\/adbanners\/|\/mini\-ads\/|\/pc\/ads\.|\/blogad\.|\/banner\-adv\-|\/banner\/adv\/|\/banner\/adv_|\/ads\.js\/|\/ads\/js\.|\/ads\/js\/|\/ads\/js_|\/adsrv\.|\/adsrv\/|\/share\-sprite\.|\/ads\/targeting\.|\/delivery\.ads\.|\/ads\.htm|\/ads\/click\?|\/house\-ads\/|\/partner\.ads\.|\/remove\-ads\.|\/click\.track\?|\/ads_reporting\/|\/realmedia\/ads\/|\.link\/ads\/|&adcount=|\/td\-ads\-|\-peel\-ads\-|\/sponsored_ad\.|\/sponsored_ad\/|\/adsys\.|\.ads\.css|\/ads\.css|\/adv\-socialbar\-|\/site\-ads\/|\/site\/ads\/|\/site\/ads\?|\/image\/ads\/|\/image\/ads_|\/log\/ad\-|\/log_ad\?|\/images\/social_|\/video\-ad\-overlay\.|\/plugins\/ads\-|\/plugins\/ads\/|\/analytics\.gif\?|\/adpartner\.|\?adpartner=|\/ads8\.|\/ads8\/|\.ads1\-|\.ads1\.|\/ads1\.|\/ads1\/|\/adsjs\.|\/adsjs\/|\/img\/social\/|\/adstop\.|\/adstop_|\/public\/js\/ad\/|\/adlog\.|\-adbanner\.|\.adbanner\.|\/adbanner\.|\/adbanner\/|\/adbanner_|=adbanner_|\/adClick\/|\/adClick\?|\-adsonar\.|\/adsonar\.|\/adserve\-|\/adserve\.|\/adserve\/|\/adserve_|\/ads\/square\-|\/ads\/square\.|\/google\-analytics\-|\/google\-analytics\.|\/google\/analytics_|\/google_analytics\.|=popunders&|\/assets\/twitter\-|&popunder=|\/popunder\.|\/popunder_|=popunder&|_popunder\+|\/new\-ads\/|\/new\/ads\/|\/social\-media\.|\/social_media\/|\/google\/adv\.|\/flash\-ads\.|\/flash\-ads\/|\/flash\/ads\/|&adspace=|\-adspace_|\.adspace\.|\/adspace\/|\/adspace\?|\/assets\/facebook\-|\/blog\/ads\/|\-banner\-ads\-|\-banner\-ads\/|\/banner\-ads\-|\/banner\-ads\/|\/ads\-async\.|\/ads\/async\/|\.ads9\.|\/ads9\.|\/ads9\/|\/lazy\-ads\-|\/lazy\-ads\.|\.ads3\-|\/ads3\.|\/ads3\/|\-adsystem\-|\/adsystem\.|\/adsystem\/|\/2\/ads\/|\/home\/ads\-|\/home\/ads\/|\/home\/ads_|\/bannerad\.|\/bannerad\/|_bannerad\.|\/adstat\.|\/stats\/event\.js\?|\/ads\/text\/|\/ads_text_|\/1\/ads\/|\/a\-ads\.|\-img\/ads\/|\/img\-ads\.|\/img\-ads\/|\/img\.ads\.|\.adsense\.|\/adsense\-|\/adsense\/|\/adsense\?|;adsense_|\.Banner\.Ads\/|=adcenter&|\/ads\/index\-|\/ads\/index\.|\/ads\/index\/|\/ads\/index_|\/ads\-new\.|\/ads_new\.|\/ads_new\/|\/static\/ads\/|_static\/ads\/|\.ads2\-|\/ads2\.|\/ads2\/|\/ads2_|\/web\-ads\.|\/web\-ads\/|\/web\/ads\/|=web&ads=|\-adscript\.|\/adscript\.|\/adscript\?|\/adscript_|\/t\/event\.js\?|\-search\-ads\.|\/search\-ads\?|\/search\/ads\?|\/search\/ads_|\/ads\-top\.|\/ads\/top\-|\/ads\/top\.|\/ads_top_|\/media\/ads\/|_media\/ads\/|\/adcontrol\/|\.sharecounter\.|\/adworks\/|\/userad\/|\/adlinks_|\/social_bookmarking\/|\/admax\/|_mainad\.|_homad\.|_WebAd[^\w.%-]|\.com\/counter\?|\-ad\-banner\-|\-ad\-banner\.|\-ad_banner\-|\/ad\-banner\-|\/ad\-banner\.|\/ad\/banner\.|\/ad\/banner\/|\/ad\/banner\?|\/ad\/banner_|\/ad_banner\.|\/ad_banner\/|\/ad_banner_|\/ad\-minister\-|\-ad0\.|\-dfp\-ads\/|\/dfp\-ads\.|\/dfp\-ads\/|\/assets\/js\/ad\.|&adserver=|\-adserver\-|\-adserver\.|\-adserver\/|\.adserver\.|\/adserver\-|\/adserver\/|\/adserver\?|\/adserver_|\/adshow\-|\/adshow\.|\/adshow\/|\/adshow\?|\/adshow_|=adshow&|\/images\.ads\.|\/images\/ads\-|\/images\/ads\.|\/images\/ads\/|\/images\/ads_|_images\/ads\/|\/tracker\/tracker\.js|\/adlink\?|\/adlink_|\/googleads_|_googleads_|\.net\/ads\-|\.net\/ads\.|\.net\/ads\/|\.net\/ads\?|\.net\/ads_|\/banner_iframe_|\-banner\-ad\-|\-banner\-ad\.|\-banner\-ad\/|\-banner\-ad_|\/banner\-ad\-|\/banner\-ad\/|\/banner\-ad_|\/banner\/ad\.|\/banner\/ad\/|\/banner\/ad_|\/banner_ad\.|_banner\-ad\.|_banner_ad\-|_banner_ad\.|_banner_ad\/|\/ads_manager\.|\/ad\.css\?|=adlabs&|\/admedia\/|\/img\/rss\.|\/img\/rss_|=advertiser\.|=advertiser\/|\?advertiser=|\/addthis_widget\.|\/adimg\/|\/adsterra\/|\/adfactory\-|\/adfactory_|\/adplayer\-|\/adplayer\/|\-adman\/|\/adman\/|\/adman_|\-adops\.|\/adops\/|\/admez\/|\/adseo\/|\/product\-ad\/|\/adnow\-|\.za\/ads\.|\/utep_ad\.js|=advanced\-ads\-|\/analytics\-v1\.|\/admaster\?|\/revealads\/|\/socialads\/|_smartads_|\/videoad\.|_videoad\.|\/ad_video\.htm|\-social\-linked\-|_social_linked_|\/exoclick$|\-images\/ad\-|\/images\-ad\/|\/images\/ad\/|\/images_ad\/|_images\/ad\.|_images\/ad_|\/adhese_|\/\?advideo\/|\?advideo_|\/newads\.|\-google\-ads\-|\-google\-ads\/|\/google\-ads\.|\/google\-ads\/|\/head\-social\.|\-online\-advert\.|\.ads4\-|\/ads4\/|\/googlead\-|\/googlead\/|_googlead\.|\/flashads\/|\-advt\.|\/advt\/|\-twitter2\.|\/sensorsdata\-|\/embed\-log\.js|\-adtrack\.|\/adtrack\/|\/smartadserver\/|&adnet=|\-google\-ad\.|\/google\-ad\-|\/google\-ad\?|\/google\/ad\?|\/google_ad\.|_google_ad\.|\/adcash\-|\/adcash$|\/download\-ad\.|\/download\/ad\.|\/popad\-|_track\/page\/|\/trackjs_|\/video\-ads\-player\.|\/chartbeat\.js)/i;
-var bad_url_parts_flag = 499 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 0 rules as an efficient NFA RegExp:
-var good_url_RegExp = /^$/;
-var good_url_regex_flag = 0 > 0 ? true : false;  // test for non-zero number of rules
-    
-// 0 rules as an efficient NFA RegExp:
-var bad_url_RegExp = /^$/;
-var bad_url_regex_flag = 0 > 0 ? true : false;  // test for non-zero number of rules
-
+        self.proxy_pac_postamble = '''
 // Add any good networks here. Format is network folowed by a comma and
 // optional white space, and then the netmask.
 // LAN, loopback, Apple (direct and Akamai e.g. e4805.a.akamaiedge.net), Microsoft (updates and services)
@@ -2929,10 +881,10 @@ var bad_schemes_RegExp = RegExp("^(?:ftp|sftp|tftp|ftp-data|rsync|finger|gopher)
 
 // RegExp for schemes; lengths from
 // perl -lane 'BEGIN{$l=0;} {!/^#/ && do{$ll=length($F[0]); if($ll>$l){$l=$ll;}};} END{print $l;}' /etc/services
-var schemepart_RegExp = RegExp("^([\\w*+-]{2,15}):\\/{0,2}","i");
-var hostpart_RegExp = RegExp("^((?:[\\w-]+\\.)+[a-zA-Z0-9-]{2,24}\\.?)", "i");
-var querypart_RegExp = RegExp("^((?:[\\w-]+\\.)+[a-zA-Z0-9-]{2,24}\\.?[\\w~%.\\/^*-]*)(\\??\\S*?)$", "i");
-var domainpart_RegExp = RegExp("^(?:[\\w-]+\\.)*((?:[\\w-]+\\.)[a-zA-Z0-9-]{2,24})\\.?", "i");
+var schemepart_RegExp = RegExp("^([\\\\w*+-]{2,15}):\\\\/{0,2}","i");
+var hostpart_RegExp = RegExp("^((?:[\\\\w-]+\\\\.)+[a-zA-Z0-9-]{2,24}\\\\.?)", "i");
+var querypart_RegExp = RegExp("^((?:[\\\\w-]+\\\\.)+[a-zA-Z0-9-]{2,24}\\\\.?[\\\\w~%.\\\\/^*-]*)(\\\\??\\\\S*?)$", "i");
+var domainpart_RegExp = RegExp("^(?:[\\\\w-]+\\\\.)*((?:[\\\\w-]+\\\\.)[a-zA-Z0-9-]{2,24})\\\\.?", "i");
 
 //////////////////////////////////////////////////
 // Define the is_ipv4_address function and vars //
@@ -3151,94 +1103,1151 @@ function EasyListFindProxyForURL(url, host)
 }
 
 // User-supplied FindProxyForURL()
-function FindProxyForURL(url, host)
-{
-if (
-   isPlainHostName(host) ||
-   shExpMatch(host, "10.*") ||
-   shExpMatch(host, "172.16.*") ||
-   shExpMatch(host, "192.168.*") ||
-   shExpMatch(host, "127.*") ||
-   dnsDomainIs(host, ".local") || dnsDomainIs(host, ".LOCAL")
-)
-        return "DIRECT";
-else if (
-   /*
-       Proxy bypass hostnames
-   */
-   /*
-       Fix iOS 13 PAC file issue with Mail.app
-       See: https://forums.developer.apple.com/thread/121928
-   */
-   // Apple
-   (host == "imap.mail.me.com") || (host == "smtp.mail.me.com") ||
-   dnsDomainIs(host, "imap.mail.me.com") || dnsDomainIs(host, "smtp.mail.me.com") ||
-   (host == "p03-imap.mail.me.com") || (host == "p03-smtp.mail.me.com") ||
-   dnsDomainIs(host, "p03-imap.mail.me.com") || dnsDomainIs(host, "p03-smtp.mail.me.com") ||
-   (host == "p66-imap.mail.me.com") || (host == "p66-smtp.mail.me.com") ||
-   dnsDomainIs(host, "p66-imap.mail.me.com") || dnsDomainIs(host, "p66-smtp.mail.me.com") ||
-   // Google
-   (host == "imap.gmail.com") || (host == "smtp.gmail.com") ||
-   dnsDomainIs(host, "imap.gmail.com") || dnsDomainIs(host, "smtp.gmail.com") ||
-   // Yahoo
-   (host == "imap.mail.yahoo.com") || (host == "smtp.mail.yahoo.com") ||
-   dnsDomainIs(host, "imap.mail.yahoo.com") || dnsDomainIs(host, "smtp.mail.yahoo.com") ||
-   // Comcast
-   (host == "imap.comcast.net") || (host == "smtp.comcast.net") ||
-   dnsDomainIs(host, "imap.comcast.net") || dnsDomainIs(host, "smtp.comcast.net") ||
-   // Apple Enterprise Network Domains; https://support.apple.com/en-us/HT210060
-   (host == "albert.apple.com") || dnsDomainIs(host, "albert.apple.com") ||
-   (host == "captive.apple.com") || dnsDomainIs(host, "captive.apple.com") ||
-   (host == "gs.apple.com") || dnsDomainIs(host, "gs.apple.com") ||
-   (host == "humb.apple.com") || dnsDomainIs(host, "humb.apple.com") ||
-   (host == "static.ips.apple.com") || dnsDomainIs(host, "static.ips.apple.com") ||
-   (host == "tbsc.apple.com") || dnsDomainIs(host, "tbsc.apple.com") ||
-   (host == "time-ios.apple.com") || dnsDomainIs(host, "time-ios.apple.com") ||
-   (host == "time.apple.com") || dnsDomainIs(host, "time.apple.com") ||
-   (host == "time-macos.apple.com") || dnsDomainIs(host, "time-macos.apple.com") ||
-   dnsDomainIs(host, ".push.apple.com") ||
-   (host == "gdmf.apple.com") || dnsDomainIs(host, "gdmf.apple.com") ||
-   (host == "deviceenrollment.apple.com") || dnsDomainIs(host, "deviceenrollment.apple.com") ||
-   (host == "deviceservices-external.apple.com") || dnsDomainIs(host, "deviceservices-external.apple.com") ||
-   (host == "identity.apple.com") || dnsDomainIs(host, "identity.apple.com") ||
-   (host == "iprofiles.apple.com") || dnsDomainIs(host, "iprofiles.apple.com") ||
-   (host == "mdmenrollment.apple.com") || dnsDomainIs(host, "mdmenrollment.apple.com") ||
-   (host == "setup.icloud.com") || dnsDomainIs(host, "setup.icloud.com") ||
-   (host == "appldnld.apple.com") || dnsDomainIs(host, "appldnld.apple.com") ||
-   (host == "gg.apple.com") || dnsDomainIs(host, "gg.apple.com") ||
-   (host == "gnf-mdn.apple.com") || dnsDomainIs(host, "gnf-mdn.apple.com") ||
-   (host == "gnf-mr.apple.com") || dnsDomainIs(host, "gnf-mr.apple.com") ||
-   (host == "gs.apple.com") || dnsDomainIs(host, "gs.apple.com") ||
-   (host == "ig.apple.com") || dnsDomainIs(host, "ig.apple.com") ||
-   (host == "mesu.apple.com") || dnsDomainIs(host, "mesu.apple.com") ||
-   (host == "oscdn.apple.com") || dnsDomainIs(host, "oscdn.apple.com") ||
-   (host == "osrecovery.apple.com") || dnsDomainIs(host, "osrecovery.apple.com") ||
-   (host == "skl.apple.com") || dnsDomainIs(host, "skl.apple.com") ||
-   (host == "swcdn.apple.com") || dnsDomainIs(host, "swcdn.apple.com") ||
-   (host == "swdist.apple.com") || dnsDomainIs(host, "swdist.apple.com") ||
-   (host == "swdownload.apple.com") || dnsDomainIs(host, "swdownload.apple.com") ||
-   (host == "swpost.apple.com") || dnsDomainIs(host, "swpost.apple.com") ||
-   (host == "swscan.apple.com") || dnsDomainIs(host, "swscan.apple.com") ||
-   (host == "updates-http.cdn-apple.com") || dnsDomainIs(host, "updates-http.cdn-apple.com") ||
-   (host == "updates.cdn-apple.com") || dnsDomainIs(host, "updates.cdn-apple.com") ||
-   (host == "xp.apple.com") || dnsDomainIs(host, "xp.apple.com") ||
-   dnsDomainIs(host, ".itunes.apple.com") ||
-   dnsDomainIs(host, ".apps.apple.com") ||
-   dnsDomainIs(host, ".mzstatic.com") ||
-   (host == "ppq.apple.com") || dnsDomainIs(host, "ppq.apple.com") ||
-   (host == "lcdn-registration.apple.com") || dnsDomainIs(host, "lcdn-registration.apple.com") ||
-   (host == "crl.apple.com") || dnsDomainIs(host, "crl.apple.com") ||
-   (host == "crl.entrust.net") || dnsDomainIs(host, "crl.entrust.net") ||
-   (host == "crl3.digicert.com") || dnsDomainIs(host, "crl3.digicert.com") ||
-   (host == "crl4.digicert.com") || dnsDomainIs(host, "crl4.digicert.com") ||
-   (host == "ocsp.apple.com") || dnsDomainIs(host, "ocsp.apple.com") ||
-   (host == "ocsp.digicert.com") || dnsDomainIs(host, "ocsp.digicert.com") ||
-   (host == "ocsp.entrust.net") || dnsDomainIs(host, "ocsp.entrust.net") ||
-   (host == "ocsp.verisign.net") || dnsDomainIs(host, "ocsp.verisign.net") ||
-   // Zoom
-   dnsDomainIs(host, ".zoom.us")
-)
-        return "PROXY localhost:3128";
-else
-        return EasyListFindProxyForURL(url, host);
-}
+''' + self.original_FindProxyForURL_function
+
+        self.easylist_strategy = """\
+EasyList rules:
+https://adblockplus.org/filters
+https://adblockplus.org/filter-cheatsheet
+https://opnsrce.github.io/javascript-performance-tip-precompile-your-regular-expressions
+https://adblockplus.org/blog/investigating-filter-matching-algorithms
+
+Strategies to convert EasyList rules to Javascript tests:
+
+In general:
+1. Preference for performance over 1:1 EasyList functionality
+2. Limit number of rules to ~O(10k) to avoid computational burden on mobile devices
+3. Exact matches: use Object hashing (very fast); use efficient NFA RegExp's for all else
+4. Divide and conquer specific cases to avoid large RegExp's
+5. Based on testing code performance on an iPhone: mobile Safari, Chrome with System Activity Monitor.app
+6. Backstop these proxy.pac rules with Privoxy rules and a browser plugin
+
+scheme://host/path?query ; FindProxyForURL(url, host) has full url and host strings
+
+EasyList rules:
+
+|| domain anchor
+
+||host is exact e.g. ||a.b^ ? then hasOwnProperty(hash,host)
+||host is wildcard e.g. ||a.* ? then RegExp.test(host)
+
+||host/path is exact e.g. ||a.b/c? ? then hasOwnProperty(hash,url_path_noquery) [strip ?'s]
+||host/path is wildcard e.g. ||a.*/c? ? then RegExp.test(url_path_noquery) [strip ?'s]
+
+||host/path?query is exact e.g. ||a.b/c?d= ? assume none [handle small number within RegExp's]
+||host/path?query is wildcard e.g. ||a.*/c?d= ? then RegExp.test(url)
+
+url parts e.g. a.b^c&d|
+
+All cases RegExp.test(url)
+Except: |http://a.b. Treat these as domain anchors after stripping the scheme
+
+regex e.g. /r/
+
+All cases RegExp.test(url)
+
+@@ exceptions
+
+Flag as "good" versus "bad" default
+
+Variable name conventions (example that defines the rule):
+
+bad_da_host_exact == bad domain anchor with host/path type, exact matching with Object hash
+bad_da_host_regex == bad domain anchor with host/path type, RegExp matching
+"""
+        return
+
+    # Use to define js object hashes (much faster than string conversion)
+    def js_init_object(self,object_name):
+        obj = globals()[object_name]
+        if bool(self.truncate_hash_max) and len(obj) > self.truncate_hash_max:
+            warnings.warn("Truncating regex alternatives rule set '{}' from {:d} to {:d}.".format(object_name,len(obj),self.truncate_hash_max))
+            obj = obj[:self.truncate_hash_max]
+        return '''\
+
+// {:d} rules:
+var {}_JSON = {}{}{};
+var {}_flag = {} > 0 ? true : false;  // test for non-zero number of rules
+'''.format(len(obj),re.sub(r'_exact$','',object_name),'{ ',",\n".join('"{}": null'.format(x) for x in obj),' }',object_name,len(obj))
+
+    def js_init_regexp(self,array_name,domain_anchor=False):
+        global n_wildcard
+        n_wildcard = 1
+        domain_anchor_replace = "^(?:[\\w-]+\\.)*?" if domain_anchor else ""
+        match_nothing_regexp = "/^$/"
+
+        # no wildcard sorting
+        # arr = [easylist_to_jsre(x) for x in globals()[array_name] if wildcard_test(x)]
+
+        arr_nostar = [x for x in globals()[array_name] if not re_test(wildcard_re,x)]
+        arr_star = [x for x in globals()[array_name] if re_test(wildcard_re,x)]
+        def wildcard_preferences(rule):
+            track_test = not re_test(re.compile(r'track',re.IGNORECASE),rule)       # MSB
+            beacon_test = not re_test(re.compile(r'beacon]',re.IGNORECASE),rule)  # LSB
+            stats_test = not re_test(re.compile(r'stat[is]]',re.IGNORECASE),rule)  # LSB
+            analysis_test = not re_test(re.compile(r'anal[iy]]',re.IGNORECASE),rule)  # LSB
+            return 8*track_test + 4*beacon_test + 2*stats_test + analysis_test
+        arr_star.sort(key=wildcard_preferences)
+        # Wildcard regex's use named groups. Limit their number to to an assumed maximum
+        # e.g. Python's re limit is 100
+        k_wildcard = 0
+        rule_kdx = self.wildcard_named_group_limit
+        for rule_kdx, rule in enumerate(arr_star):
+            k_wildcard += len(arr_star[rule_kdx].split('*'))-1
+            if k_wildcard > self.wildcard_named_group_limit: break
+        arr_star = arr_star[:rule_kdx]
+        arr = arr_nostar + arr_star
+
+        if re_test(r'(?:_parts|_regex)$',array_name) and bool(self.truncate_alternatives_max) and len(arr) > self.truncate_alternatives_max:
+            warnings.warn("Truncating regex alternatives rule set '{}' from {:d} to {:d}.".format(array_name,len(arr),self.truncate_alternatives_max))
+            arr = arr[:self.truncate_alternatives_max]
+
+        arr = [easylist_to_jsre(x) for x in arr]
+        arr_regexp = "/" + domain_anchor_replace + "(?:" + "|".join(arr) + ")/i"
+        if len(arr) == 0: arr_regexp = match_nothing_regexp
+
+        return '''\
+    
+// {:d} rules as an efficient NFA RegExp:
+var {}_RegExp = {};
+var {}_flag = {} > 0 ? true : false;  // test for non-zero number of rules
+'''.format(len(arr),re.sub(r'_regex$','',array_name),arr_regexp,array_name,len(arr))
+    # end of EasyListPAC definition
+
+# global variables and functions
+
+def last_modified_resp(req):
+    header_dict = dict(req.getheaders())
+    lm = header_dict.get("Last-Modified") if "Last-Modified" in header_dict else \
+        header_dict.get("Date","Sun, 01 Apr 2018 00:00:00 GMT")
+    return lm
+last_modified_to_utc = lambda lm: time.mktime(datetime.datetime.strptime(lm,"%a, %d %b %Y %X GMT").timetuple())
+file_to_utc = lambda f: time.mktime(datetime.datetime.utcfromtimestamp(os.path.getmtime(f)).timetuple())
+
+user_agent = 'Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko'
+
+# Monkey patch `re.sub` (***groan***)
+# See https://gist.github.com/gromgull/3922244
+if (sys.version_info < (3, 5)):
+    def re_sub(pattern, replacement, string):
+        def _r(m):
+            # Now this is ugly.
+            # Python has a "feature" where unmatched groups return None
+            # then re.sub chokes on this.
+            # see http://bugs.python.org/issue1519638
+
+            # this works around and hooks into the internal of the re module...
+
+            # the match object is replaced with a wrapper that
+            # returns "" instead of None for unmatched groups
+
+            class _m():
+                def __init__(self, m):
+                    self.m = m
+                    self.string = m.string
+
+                def group(self, n):
+                    return m.group(n) or ""
+
+            return re._expand(pattern, _m(m), replacement)
+
+        return re.sub(pattern, _r, string)
+else:
+    re_sub = re.sub
+
+# print(re_sub('(ab)|(a)', r'(1:\1 2:\2)', 'abc'))
+# prints '(1:ab 2:)c'
+
+# My extra rules
+my_extra_rules = ['||outbrain.com^',
+                  '||taboola.com^']
+
+# EasyList regular expressions
+
+comment_re = re.compile(r'^\s*?!')   # ! commment
+configuration_re = re.compile(r'^\s*?\[[^]]*?\]')  # [Adblock Plus 2.0]
+easylist_opts = r'~?\b(?:third\-party|domain|script|image|stylesheet|object(?!-subrequest)|object\-subrequest|xmlhttprequest|subdocument|ping|websocket|webrtc|document|elemhide|generichide|genericblock|other|sitekey|match-case|collapse|donottrack|popup|media|font)\b'
+option_re = re.compile(r'^(.*?)\$(' + easylist_opts + r'.*?)$')
+# regex's used to exclude options for specific cases
+alloption_exception_re = re.compile(easylist_opts)  # discard all options from rules
+not3dimppupos_option_exception_re = re.compile(r'~?\b(?:domain|script|stylesheet|object(?!-subrequest)|xmlhttprequest|subdocument|ping|websocket|webrtc|document|elemhide|generichide|genericblock|other|sitekey|match-case|collapse|donottrack|media|font)\b')
+not3dimppuposgh_option_exception_re = re.compile(r'~?\b(?:domain|script|stylesheet|object(?!-subrequest)|xmlhttprequest|subdocument|ping|websocket|webrtc|document|elemhide|genericblock|other|sitekey|match-case|collapse|donottrack|media|font)\b')
+thrdp_im_pup_os_option_re = re.compile(r'\b(?:third\-party|image|popup|object\-subrequest)\b')
+selector_re = re.compile(r'^(.*?)#\@?#*?.*?$') # #@##div [should be #+?, but old style still used]
+regex_re = re.compile(r'^\@{0,2}\/(.*?)\/$')
+wildcard_begend_re = re.compile(r'^(?:\**?([^*]*?)\*+?|\*+?([^*]*?)\**?)$')
+wild_anch_sep_exc_re = re.compile(r'[*|^@]')
+wild_sep_exc_noanch_re = re.compile(r'(?:[*^@]|\|[\s\S])')
+exception_re = re.compile(r'^@@(.*?)$')
+wildcard_re = re.compile(r'\*+?')
+httpempty_re = re.compile(r'^\|?https?://$')
+# Note: assume path end rules the end in '/' are partial, not exact, e.g. host.com/path/
+pathend_re = re.compile(r'(?:\||\.(?:jsp?|php|xml|jpe?g|png|p?gif|img|swf|flv|[sp]?html?|f?cgi|pl?|aspx|ashx|css|jsonp?|asp|search|cfm|ico|act|act(?:ion)?|spy|do|stm|cms|txt|imu|dll|io|smjs|xhr|ount|bin|py|dyn|gne|mvc|lv|nap|jam|nhn))$',re.IGNORECASE)
+
+domain_anch_re = re.compile(r'^\|\|(.+?)$')
+# omit scheme from start of rule -- this will also be done in JS for efficiency
+scheme_anchor_re = re.compile(r'^(\|?(?:[\w*+-]{1,15})?://)');  # e.g. '|http://' at start
+
+# (Almost) fully-qualified domain name extraction (with EasyList wildcards)
+# Example case: banner.3ddownloads.com^
+da_hostonly_re = re.compile(r'^((?:[\w*-]+\.)+[a-zA-Z0-9*-]{1,24}\.?)(?:$|[/^?])$')
+da_hostpath_re = re.compile(r'^((?:[\w*-]+\.)+[a-zA-Z0-9*-]{1,24}\.?[\w~%./^*-]*?)\??$')
+
+ipv4_re = re.compile(r'(?:\d{1,3}\.){3}\d{1,3}')
+
+host_path_parts_re = re.compile(r'^(?:https?://)?((?:\d{1,3}\.){3}\d{1,3}|(?:[\w-]+\.)+[a-zA-Z0-9-]{2,24})?\.?(\S+)?',re.IGNORECASE)
+
+punct_str = r'][{}()<>.,;:?/~!#$%^&*_=+`\'"|\s-'
+punct_class = r'[{}]'.format(punct_str)
+nopunct_class = r'[^{}]'.format(punct_str)
+specialword_re = r'<\w+>'
+hostpunct_str = punct_str[:-1]  # everything but '-'
+hostpunct_class = r'[{}]'.format(hostpunct_str)
+
+# regex logic: (keep1|keep2)|([::discard class::]+?)
+# (<\w+>|\b(?:\w+[.])+[a-zA-Z0-9-]{2,24}\b)|([][()<>.;-]+?)
+punct_deletepreserve_re = r'({}|\b{}\b)|({}+?)'.format(specialword_re,ipv4_re.pattern,punct_class)
+punct_deletepreserve_reprog = re.compile(punct_deletepreserve_re)
+punct_deletepreserve_replace = '\\1 '
+hostpunct_deletepreserve_re = r'({}|\b{}\b)|({}+?)'.format(specialword_re,ipv4_re.pattern,hostpunct_class)
+hostpunct_deletepreserve_reprog = re.compile(hostpunct_deletepreserve_re)
+whitespace_reprog = re.compile(r'\s+')
+whitespace_replace = ' '
+
+def exception_filter(line):
+    return bool(exception_re.search(line))
+def line_hostpath_rule(line):
+   line = exception_re.sub(r'\1',line)
+   line = domain_anch_re.sub(r'\1',line)
+   line = option_re.sub(r'\1',line)
+   return line
+def punct_delete(line,punct_re=punct_deletepreserve_reprog):
+    res = line
+    res = re_sub(punct_re,punct_deletepreserve_replace,res)
+    res = re_sub(whitespace_reprog,whitespace_replace,res)
+    return res
+def rule_tokenizer(rule):
+    rule = line_hostpath_rule(rule)
+    host_part = re_sub(host_path_parts_re,r'\1',rule)
+    path_part = re_sub(host_path_parts_re,r'\2',rule)
+    toks = ' '.join([punct_delete(host_part,punct_re=hostpunct_deletepreserve_reprog), punct_delete(path_part)]).strip()
+    toks = re_sub(whitespace_reprog,whitespace_replace,toks)
+    return toks
+easylist_name_opts_re = re.compile(r'^~?\b(third\-party|domain|script|image|stylesheet|object(?!-subrequest)|object\-subrequest|xmlhttprequest|subdocument|ping|websocket|webrtc|document|elemhide|generichide|genericblock|other|sitekey|match-case|collapse|donottrack|popup|media|font)(?:=.+?)?$')
+def option_tokenizer(opts):
+    toks = ' '.join([easylist_name_opts_re.sub(r'\1',o) for o in opts.split(',')])
+    return toks
+
+# use or not use regular expression rules of any kind
+def regex_ignore_test(line,opts=''):
+    res = False  # don't ignore any rule
+    # ignore wildcards and anchors
+    # res = re_test(r'[*^]',line)
+    return res
+
+def re_test(regex,string):
+    if isinstance(regex,str): regex = re.compile(regex)
+    return bool(regex.search(string))
+
+# Logistic Regression functions
+
+# feature vector hashes
+# JSON structure: {"token": { "column": list of int, "count": list of int, "row_index": int }
+# create adjacency lists for memory efficient sparse COO array construction
+
+default_row = {"column": [], "count": []}
+def feature_vector_append_column(rule,opts,col,feature_vector={}):
+    # rule grams
+    toks = re.split(r'\s+',rule_tokenizer(rule))
+    for k in range(len(toks)):
+        # 1- and 2-grams
+        grams = [toks[k], toks[k] + ' ' + toks[k + 1]] if k < len(toks) - 1 else [toks[k]]
+        feature_vector_append_grams(grams, col, feature_vector, weight=1/np.sqrt(len(toks)))
+    if bool(opts):
+        # option tokens (1-grams)
+        grams = ['option: ' + x for x in re.split(r'\s+', option_tokenizer(opts))]
+        feature_vector_append_grams(grams, col, feature_vector, weight=min(0.5, 1.e-1/np.sqrt(len(grams))))
+    if len(toks) <= 3:
+        """Add information from available options and high weight regex matches."""
+        # regex tokens used to relate for short, unique rules
+        grams = []
+        for regex in high_weight_regex:
+            if bool(regex.search(rule)): grams.append('regex: ' + regex.pattern)
+        if bool(grams): feature_vector_append_grams(grams, col, feature_vector, weight=1/np.sqrt(len(grams)))
+
+def feature_vector_append_grams(grams, col, feature_vector={}, weight=1.):
+    for ky in grams:
+        feature_vector[ky] = feature_vector.get(ky, copy.deepcopy(default_row))
+        if not feature_vector[ky]["column"] or feature_vector[ky]["column"][-1] is not col:
+            feature_vector[ky]["column"].append(col)
+            feature_vector[ky]["count"].append(0)
+        feature_vector[ky]["count"][-1] += weight
+
+# store feature vectors as sparse arrays
+def fv_to_mat(feature_vector=copy.deepcopy(default_row),rules=[]):
+    """Compute sparse, transposed, CSR matrix and row hash from a feature vector."""
+    row_hash = {}
+    rows = []
+    cols = []
+    vals = []
+    for i, tok in enumerate(feature_vector):
+        feature_vector[tok]["row_index"] = i
+        row_hash[i] = tok
+        j_new = feature_vector[tok]["column"]
+        i_new = [i]*len(j_new)
+        v_new = feature_vector[tok]["count"]
+        rows += i_new
+        cols += j_new
+        vals += v_new
+    fv_mat = sps.coo_matrix((vals,(cols,rows)),shape=(len(rules),len(feature_vector)),dtype=np.float).tocsr()
+    return fv_mat, row_hash
+
+# convert EasyList wildcard '*', separator '^', and anchor '|' to regexp; ignore '?' globbing
+# http://blogs.perl.org/users/mauke/2017/05/converting-glob-patterns-to-efficient-regexes-in-perl-and-javascript.html
+# For efficiency this these are converted in Python; observed to be important in iSO kernel
+
+# var domain_anchor_RegExp = RegExp("^\\\\|\\\\|");
+# // performance: use a simplified, less inclusive of subdomains, regex for domain anchors
+# // also assume that RexgExp("^https?//") stripped from url string beforehand
+# //var domain_anchor_replace = "^(?:[\\\\w\\-]+\\\\.)*?";
+# var domain_anchor_replace = "^";
+# var n_wildcard = 1;
+# function easylist2re(pat) {
+#     function tr(pat) {
+#         return pat.replace(/[-\\/.?:!+^|$()[\\]{}]/g, function (m0, mp, ms) {  // url, regex, EasyList special chars
+#             // res = m0 === "?" ? "[\\s\\S]" : "\\\\" + m0;
+#             // https://adblockplus.org/filters#regexps, separator "^" == [^\\w.%-]
+#             var res = "\\\\" + m0;
+#             switch (m0) {
+#             case "^":
+#                 res = "[^\\\\w.%-]";
+#                 break;
+#             case "|":
+#                 res = mp + m0.length === ms.length ? "$" : "^";
+#                 break;
+#             default:
+#                 res = "\\\\" + m0;  // escape special characters
+#             }
+#             return res;
+#         });
+#     }
+#
+#     // EasyList domain anchor "||"
+#     var bos = "";
+#     if (domain_anchor_RegExp.test(pat)) {
+#         pat = pat.replace(domain_anchor_RegExp, "");  // strip "^||"
+#         bos = domain_anchor_replace;
+#     }
+#
+#     // EasyList wildcards '*', separators '^', and start/end anchors '|'
+#     // define n_wildcard outside the function for concatenation of these patterns
+#     // var n_wildcard = 1;
+#     pat = bos + pat.replace(/\\W[^*]*/g, function (m0, mp, ms) {
+#         if (m0.charAt(0) !== "*") {
+#             return tr(m0);
+#         }
+#         // var eos = mp + m0.length === ms.length ? "$" : "";
+#         var eos = "";
+#         return "(?=([\\\\s\\\\S]*?" + tr(m0.substr(1)) + eos + "))\\\\" + n_wildcard++;
+#     });
+#     return pat;
+# }
+
+n_wildcard = 1
+def easylist_to_jsre(pat):
+    def re_easylist(match):
+        mg = match.group()[0]
+        # https://adblockplus.org/filters#regexps, separator "^" == [^\\w.%-]
+        if mg == "^":
+            res = "[^\\w.%-]"
+        elif mg == "|":
+            res = "^" if match.span()[0] == 0 else "$"
+        else:
+            res = '\\' + mg
+        return res
+    def tr(pat):
+        return re.sub(r'[-\/.?:!+^|$()[\]{}]', re_easylist, pat)
+    def re_wildcard(match):
+        global n_wildcard
+        mg = match.group()
+        if mg[0] != "*": return tr(mg)
+        res = '(?=([\\s\\S]*?' + tr(mg[1:]) + '))\\' + '{:d}'.format(n_wildcard)
+        n_wildcard += 1
+        return res
+    domain_anchor_replace = "^(?:[\\w-]+\\.)*?"
+    bos = ''
+    if re_test(domain_anch_re,pat):
+        pat = domain_anch_re.sub(r'\1',pat)
+        bos = domain_anchor_replace
+    pat = bos + re.sub(r'(\W[^*]*)', re_wildcard, pat)
+    return pat
+
+def ordered_unique_all_js_var_lists():
+    global good_da_host_exact
+    global good_da_host_regex
+    global good_da_hostpath_exact
+    global good_da_hostpath_regex
+    global good_da_regex
+    global good_da_host_exceptions_exact
+
+    global bad_da_host_exact
+    global bad_da_host_regex
+    global bad_da_hostpath_exact
+    global bad_da_hostpath_regex
+    global bad_da_regex
+
+    global good_url_parts
+    global bad_url_parts
+    global good_url_regex
+    global bad_url_regex
+
+    good_da_host_exact = ordered_unique_nonempty(good_da_host_exact)
+    good_da_host_regex = ordered_unique_nonempty(good_da_host_regex)
+    good_da_hostpath_exact = ordered_unique_nonempty(good_da_hostpath_exact)
+    good_da_hostpath_regex = ordered_unique_nonempty(good_da_hostpath_regex)
+    good_da_regex = ordered_unique_nonempty(good_da_regex)
+    good_da_host_exceptions_exact = ordered_unique_nonempty(good_da_host_exceptions_exact)
+
+    bad_da_host_exact = ordered_unique_nonempty(bad_da_host_exact)
+    bad_da_host_regex = ordered_unique_nonempty(bad_da_host_regex)
+    bad_da_hostpath_exact = ordered_unique_nonempty(bad_da_hostpath_exact)
+    bad_da_hostpath_regex = ordered_unique_nonempty(bad_da_hostpath_regex)
+    bad_da_regex = ordered_unique_nonempty(bad_da_regex)
+
+    good_url_parts = ordered_unique_nonempty(good_url_parts)
+    bad_url_parts = ordered_unique_nonempty(bad_url_parts)
+    good_url_regex = ordered_unique_nonempty(good_url_regex)
+    bad_url_regex = ordered_unique_nonempty(bad_url_regex)
+
+# ordered uniqueness, https://stackoverflow.com/questions/12897374/get-unique-values-from-a-list-in-python
+ordered_unique_nonempty = lambda listable: fnt.reduce(lambda l, x: l.append(x) or l if x not in l and bool(x) else l, listable, [])
+
+# list variables based on EasyList strategies above
+# initial values prepended before EasyList rules
+# pass updates and services from these domains
+# handle organization-specific ad and tracking servers in later commit
+# https://support.apple.com/en-us/HT210060
+good_da_host_exact = ['apple.com',
+                      'albert.apple.com',
+                      'captive.apple.com',
+                      'gs.apple.com',
+                      'humb.apple.com',
+                      'static.ips.apple.com',
+                      'tbsc.apple.com',
+                      'time-ios.apple.com',
+                      'time.apple.com',
+                      'time-macos.apple.com',
+                      'gdmf.apple.com',
+                      'deviceenrollment.apple.com',
+                      'deviceservices-external.apple.com',
+                      'identity.apple.com',
+                      'iprofiles.apple.com',
+                      'mdmenrollment.apple.com',
+                      'setup.icloud.com',
+                      'appldnld.apple.com',
+                      'gg.apple.com',
+                      'gnf-mdn.apple.com',
+                      'gnf-mr.apple.com',
+                      'gs.apple.com',
+                      'ig.apple.com',
+                      'mesu.apple.com',
+                      'oscdn.apple.com',
+                      'osrecovery.apple.com',
+                      'skl.apple.com',
+                      'swcdn.apple.com',
+                      'swdist.apple.com',
+                      'swdownload.apple.com',
+                      'swpost.apple.com',
+                      'swscan.apple.com',
+                      'updates-http.cdn-apple.com',
+                      'updates.cdn-apple.com',
+                      'xp.apple.com',
+                      'ppq.apple.com',
+                      'lcdn-registration.apple.com',
+                      'crl.apple.com',
+                      'crl.entrust.net',
+                      'crl3.digicert.com',
+                      'crl4.digicert.com',
+                      'ocsp.apple.com',
+                      'ocsp.digicert.com',
+                      'ocsp.entrust.net',
+                      'ocsp.verisign.net',
+                      'icloud.com',
+                      'apple-dns.net',
+                      'swcdn.apple.com',
+                      'init.itunes.apple.com',  # use nslookup to determine canonical names
+                      'init-cdn.itunes-apple.com.akadns.net',
+                      'itunes.apple.com.edgekey.net',
+                      'setup.icloud.com',
+                      'p32-escrowproxy.icloud.com',
+                      'p32-escrowproxy.fe.apple-dns.net',
+                      'keyvalueservice.icloud.com',
+                      'keyvalueservice.fe.apple-dns.net',
+                      'p32-bookmarks.icloud.com',
+                      'p32-bookmarks.fe.apple-dns.net',
+                      'p32-ckdatabase.icloud.com',
+                      'p32-ckdatabase.fe.apple-dns.net',
+                      'configuration.apple.com',
+                      'configuration.apple.com.edgekey.net',
+                      'mesu.apple.com',
+                      'mesu-cdn.apple.com.akadns.net',
+                      'mesu.g.aaplimg.com',
+                      'gspe1-ssl.ls.apple.com',
+                      'gspe1-ssl.ls.apple.com.edgekey.net',
+                      'api-glb-bos.smoot.apple.com',
+                      'query.ess.apple.com',
+                      'query-geo.ess-apple.com.akadns.net',
+                      'query.ess-apple.com.akadns.net',
+                      'setup.fe.apple-dns.net',
+                      'gsa.apple.com',
+                      'gsa.apple.com.akadns.net',
+                      'icloud-content.com',
+                      'usbos-edge.icloud-content.com',
+                      'usbos.ce.apple-dns.net',
+                      'lcdn-locator.apple.com',
+                      'lcdn-locator.apple.com.akadns.net',
+                      'lcdn-locator-usuqo.apple.com.akadns.net',
+                      'cl1.apple.com',
+                      'cl2.apple.com',
+                      'cl3.apple.com',
+                      'cl4.apple.com',
+                      'cl5.apple.com',
+                      'cl1-cdn.origin-apple.com.akadns.net',
+                      'cl2-cdn.origin-apple.com.akadns.net',
+                      'cl3-cdn.origin-apple.com.akadns.net',
+                      'cl4-cdn.origin-apple.com.akadns.net',
+                      'cl5-cdn.origin-apple.com.akadns.net',
+                      'cl1.apple.com.edgekey.net',
+                      'cl2.apple.com.edgekey.net',
+                      'cl3.apple.com.edgekey.net',
+                      'cl4.apple.com.edgekey.net',
+                      'cl5.apple.com.edgekey.net',
+                      'xp.apple.com',
+                      'xp.itunes-apple.com.akadns.net',
+                      'mt-ingestion-service-pv.itunes.apple.com',
+                      'p32-sharedstreams.icloud.com',
+                      'p32-sharedstreams.fe.apple-dns.net',
+                      'p32-fmip.icloud.com',
+                      'p32-fmip.fe.apple-dns.net',
+                      'gsp-ssl.ls.apple.com',
+                      'gsp-ssl.ls-apple.com.akadns.net',
+                      'gsp-ssl.ls2-apple.com.akadns.net',
+                      'gspe35-ssl.ls.apple.com',
+                      'gspe35-ssl.ls-apple.com.akadns.net',
+                      'gspe35-ssl.ls.apple.com.edgekey.net',
+                      'gsp64-ssl.ls.apple.com',
+                      'gsp64-ssl.ls-apple.com.akadns.net',
+                      'mt-ingestion-service-st11.itunes.apple.com',
+                      'mt-ingestion-service-st11.itunes-apple.com.akadns.net',
+                      'microsoft.com', 'mozilla.com', 'mozilla.org']
+good_da_host_regex = ['||push.apple.com^',
+                      '||itunes.apple.com^',
+                      '||apps.apple.com^',
+                      '||mzstatic.com^']
+good_da_hostpath_exact = []
+good_da_hostpath_regex = []
+good_da_regex = []
+bad_da_host_exact = []
+bad_da_host_regex = []
+bad_da_hostpath_exact = []
+bad_da_hostpath_regex = []
+bad_da_regex = []
+good_url_parts = []
+bad_url_parts = []
+good_url_regex = []
+bad_url_regex = []
+
+# provide explicit expceptions to good hosts or domains, e.g. iad.apple.com
+good_da_host_exceptions_exact = [ 'iad.apple.com',
+                                  'iadsdk.apple.com',
+                                  'iadsdk.apple.com.edgekey.net',
+                                  'bingads.microsoft.com',
+                                  'azure.bingads.trafficmanager.net',
+                                  'choice.microsoft.com',
+                                  'choice.microsoft.com.nsatc.net',
+                                  'corpext.msitadfs.glbdns2.microsoft.com',
+                                  'corp.sts.microsoft.com',
+                                  'df.telemetry.microsoft.com',
+                                  'diagnostics.support.microsoft.com',
+                                  'feedback.search.microsoft.com',
+                                  'i1.services.social.microsoft.com',
+                                  'i1.services.social.microsoft.com.nsatc.net',
+                                  'redir.metaservices.microsoft.com',
+                                  'reports.wes.df.telemetry.microsoft.com',
+                                  'services.wes.df.telemetry.microsoft.com',
+                                  'settings-sandbox.data.microsoft.com',
+                                  'settings-win.data.microsoft.com',
+                                  'sqm.df.telemetry.microsoft.com',
+                                  'sqm.telemetry.microsoft.com',
+                                  'sqm.telemetry.microsoft.com.nsatc.net',
+                                  'statsfe1.ws.microsoft.com',
+                                  'statsfe2.update.microsoft.com.akadns.net',
+                                  'statsfe2.ws.microsoft.com',
+                                  'survey.watson.microsoft.com',
+                                  'telecommand.telemetry.microsoft.com',
+                                  'telecommand.telemetry.microsoft.com.nsatc.net',
+                                  'telemetry.urs.microsoft.com',
+                                  'vortex.data.microsoft.com',
+                                  'vortex-sandbox.data.microsoft.com',
+                                  'vortex-win.data.microsoft.com',
+                                  'cy2.vortex.data.microsoft.com.akadns.net',
+                                  'watson.microsoft.com',
+                                  'watson.ppe.telemetry.microsoft.com'
+                                  'watson.telemetry.microsoft.com',
+                                  'watson.telemetry.microsoft.com.nsatc.net',
+                                  'wes.df.telemetry.microsoft.com',
+                                  'win10.ipv6.microsoft.com',
+                                  'www.bingads.microsoft.com',
+                                  'survey.watson.microsoft.com' ]
+
+# Long regex filter """here""" documents
+
+# ignore any rules following comments with these strings, until the next non-ignorable comment
+commentname_sections_ignore_re = r'(?:{})'.format('|'.join(re.sub(r'([.])','\\.',x) for x in '''\
+gizmodo.in
+shink.in
+project-free-tv.li
+pencurimovie.ph
+filmlinks4u.is
+French
+Arabic
+Armenian
+Belarusian
+Bulgarian
+Chinese
+Croatian
+Czech
+Danish
+Estonian
+Finnish
+Georgian
+Hebrew
+Hungarian
+Icelandic
+Indian
+Indonesian
+Italian
+Japanese
+Korean
+Latvian
+Lithuanian
+Norwegian
+Persian
+Polish
+Portuguese
+Romanian
+Serbian
+Singaporean
+Slovene
+Slovak
+Spanish
+Swedish
+Thai
+Turkish
+Vietnamese
+planetsnow.de'''.split('\n')))
+
+# include these rules, no matter their priority
+# necessary to include desired rules that fall below the threshold for a reasonably-sized PAC
+# Refs: https://guardianapp.com/ios-app-location-report-sep2018.html
+include_these_good_rules = []
+include_these_bad_rules = [x for x in """\
+/securepubads.
+||google.com/pagead
+||facebook.com/plugins/*
+||connect.facebook.com
+||connect.facebook.net
+||platform.twitter.com
+||api.areametrics.com
+||in.cuebiq.com
+||et.intake.factual.com
+||api.factual.com
+||api.beaconsinspace.com
+||api.huq.io
+||m2m-api.inmarket.com
+||mobileapi.mobiquitynetworks.com
+||sdk.revealmobile.com
+||api.safegraph.com
+||incoming-data-sense360.s3.amazonaws.com
+||ios-quinoa-personal-identify-prod.sense360eng.com
+||ios-quinoa-events-prod.sense360eng.com
+||ios-quinoa-high-frequency-events-prod.sense360eng.com
+||v1.blueberry.cloud.databerries.com
+||pie.wirelessregistry.com""".split('\n') if not bool(re.search(r'^\s*?(?:#|$)',x))]
+
+# regex's for highly weighted rules
+high_weight_regex_strings = """\
+trac?k
+beacon
+stat[is]?
+anal[iy]
+goog
+facebook
+yahoo
+amazon
+adob
+msn
+# 2-grams
+goog\\S+?ad
+amazon\\S+?ad
+yahoo\\S+?ad
+facebook\\S+?ad
+adob\\S+?ad
+msn\\S+ad
+doubleclick
+cooki
+twitter
+krxd
+pagead
+syndicat
+(?:\\bad|ad\\b)
+securepub
+static
+\\boas\\b
+ads
+cdn
+cloud
+banner
+financ
+share
+traffic
+creativ
+media
+host
+affil
+^mob
+data
+your?
+watch
+survey
+stealth
+invisible
+brand
+site
+merch
+kli[kp]
+clic?k
+popup
+log
+assets
+count
+metric
+score
+event
+tool
+quant
+chart
+opti?m
+partner
+sponsor
+affiliate"""
+
+high_weight_regex = [re.compile(x,re.IGNORECASE) for x in high_weight_regex_strings.split('\n') if not bool(re.search(r'^\s*?(?:#|$)',x))]
+
+# regex to limit regex filters (bootstrapping in part from securemecca.com PAC regex keywords)
+if False:
+    badregex_regex_filters = ''  # Accept everything
+else:
+    badregex_regex_filters = high_weight_regex_strings + '\n' + '''\
+cooki
+pagead
+syndicat
+(?:\\bad|ad\\b)
+cdn
+cloud
+banner
+image
+img
+pop
+game
+free
+financ
+film
+fast
+farmville
+fan
+exp
+share
+cash
+money
+dollar
+buck
+dump
+deal
+daily
+content
+kick
+down
+file
+video
+score
+partner
+match
+ifram
+cam
+widget
+monk
+rapid
+platform
+google
+follow
+shop
+love
+content
+#^(\\d{1,3})\\.(\d{1,3})\\.(\\d{1,3})\.(\\d{1,3})$
+#^([A-Za-z]{12}|[A-Za-z]{8}|[A-Za-z]{50})\\.com$
+smile
+happy
+traffic
+dash
+board
+tube
+torrent
+down
+creativ
+host
+affil
+\\.(biz|ru|tv|stream|cricket|online|racing|party|trade|webcam|science|win|accountant|loan|faith|cricket|date)
+^mob
+join
+data
+your?
+watch
+survey
+stealth
+invisible
+social
+brand
+site
+script
+xchang
+merch
+kli(k|p)
+clic?k
+zip
+invest
+arstech
+buzzfeed
+imdb
+twitter
+baidu
+yandex
+youtube
+ebay
+discovercard
+chase
+hsbc
+usbank
+santander
+kaspersky
+symantec
+brightcove
+hidden
+invisible
+macromedia
+flash
+[^i]scan[^dy]
+secret
+skype
+tsbbank
+tunnel
+ubs\\.com
+unblock
+unlock
+usaa\\.com
+usbank\\.com
+ustreas\\.gov
+ustreasury
+verifiedbyvisa\\.com
+viagra
+wachovia
+wellsfargo\\.com
+westernunion
+windowsupdate
+plugin
+nielsen
+oas-config
+oas\\/oas
+pix
+video-plugin
+videodownloader
+visit
+voxmedia\\.com
+vtrack\\.php
+w3track\\.com
+web_?ad
+webiq
+weblog
+webtrek
+webtrend
+wget\\.exe
+widgets
+winstart\\.exe
+winstart\\.zip
+wired\\.com
+ad-limits\\.js
+ad-manager
+ad_engine
+adx\\.js
+\\.bat
+\\.bin
+[^ck]anal[^_]
+\\.com\/a\\.gif
+\\.com\/p\\.gif
+\\.com\\.au\\/ads
+\\.cpl
+[^bhmz]eros
+\\.exe
+\\.exe
+\\.msi
+\\.net\\/p\\.gif
+\\.pac
+\\.pdf
+\\.pdf\\.exe
+\\.rar
+\\.scr
+\\.sh
+transparent1x1\\.gif
+\\/travidia
+__utm\\.js
+whv2_001\\.js
+xtcore\\.js
+\\.zip
+sharethis\\.com
+stats\\.wp\\.com
+[^i]crack
+virgins\\.com
+\\.xyz
+shareasale\\.com
+financialcontent\\.com
+netdna-cdn\\.com
+gstatic\\.com
+taboola\\.com
+ooyala\\.com
+pinimg\\.com
+cloudfront\\.net
+d21rhj7n383afu
+d19rpgkrjeba2z
+outbrain\\.com
+themindcircle\\.com
+google-analytics\\.com
+nocookie\\.net
+jwpsrv\\.com
+doubleclick\\.net
+d2c8v52ll5s99u
+d3qdfnco3bamip
+yarn\\.co
+visura\\.co
+gatehousmedia\\.com
+imore\\.com
+openx\\.net
+gigya\\.com
+shopify\\.com
+tiqcdn\\.com
+criteo\\.net
+ntv\\.io
+getyarn\\.io
+d15zn84cat5tp0
+d1pz6dax0t5mop
+allinviews\\.com
+pinterest\\.com
+media\\.net
+selectmedia\\.asia
+jsdelivr\\.net
+pubmatic\\.com
+aurubis\\.com
+cloudflare\\.com
+blueconic\\.net
+krxd\\.net
+cdn-mw\\.com
+serving-sys\\.com
+openx\\.net
+segment\\.com
+viglink\\.com
+viafoura\\.net
+aolcdn\\.net
+shoofl\\.tv
+inq\\.com
+optimizely\\.com
+kinja-static\\.com
+d3926qxcw0e1bh
+yieldmo\\.com
+indexww\\.com
+2mdn\\.net
+newrelic\\.com
+guim\\.co\\.uk
+futurecdn\\.net
+vidible\\.tv
+vindicosuite\\.com
+fsdn\\.com
+cpanel\\.net
+perfectmarket\\.com
+about\\.me
+omnigroup\\.com
+lightboxcdn\\.com
+hotjar\\.com
+addthis\\.com
+art19\\.com
+lkqd\\.net
+mathtag\\.com
+dc8xl0ndzn2cb
+d1z2jf7jlzjs58
+chowstatic\\.com
+spokenlayer\\.com
+akamaized\\.net
+d2qi7ewimk4e2w
+stickyadstv\\.com
+fastly\\.net
+ddkpmexz7bq23
+newscgp\\.com
+privy\\.com
+aspnetcdn\\.com
+parsley\\.com
+demdex\\.net
+d3alqb8vzo7fun
+netdna-ssl\\.com
+yottaa\\.net
+go-mpulse\\.net
+bkrtx\\.com
+crwdcntrl\\.net
+ggpht\\.com
+alamy\\.com
+spokeo\\.com
+d2gatte9o95jao
+dawm7kda6y2v0
+dwgyu36up6iuz
+litix\\.io
+sail-horizon\\.com
+cnevids\\.com
+dz310nzuyimx0
+skimresources\\.com
+jwpcdn\\.com
+dwin2\\.com
+htl\\.bid
+df80k0z3fi8zg
+o0bg\\.com
+d8rk54i4mohrb
+simplereach\\.com
+adsrvr\\.com
+vertamedia\\.com
+disqusads\\.com
+polipace\\.com
+jwplatform\\.com
+dianomi\\.com
+kinja-img\\.com
+marketingvideonow\\.com
+beachfrontmedia\\.com
+mfcreative\\.com
+msecdn\\.com
+syndetics\\.com
+keycdn\\.com
+uservoice\\.com
+ravenjs\\.com
+d1fc8wv8zag5ca
+broaddoor\\.com
+d3s44e87wooplq
+d2x3bkdslnxkuj
+selectablemedia\\.com
+yldbt\\.com
+streamrail\\.net
+seriable\\.com
+thoughtco\\.com
+perimeterx\\.net
+owneriq\\.net
+ml314\\.com
+d1e9d0h8gakqc
+dtcn\\.com
+trustarc\\.com
+licdn\\.com
+effectivemeasure\\.net
+list-manage\\.com
+mtvnservices\\.com
+npttech\\.com
+dc8na2hxrj29i
+tubemogul\\.com
+d1lqe9temigv1p
+dna8twue3dlxq
+adroll\\.com
+googleadservices\\.com
+localytics\\.com
+gfx\\.ms
+adsensecustomsearchads\\.com
+upsellit\\.com
+parrable\\.com
+ads-twitter\\.com
+atlanticinsights\\.com
+pagefair\\.com
+areyouahuman\\.com
+custhelp\\.com
+turn\\.com
+connatix\\.com
+printfriendly\\.com
+scroll\\.com
+cybersource\\.com
+zergnet\\.com
+jsintegrity\\.com
+cedexis\\.com
+3lift\\.com
+onestore\\.ms
+mdpcdn\\.com
+iperceptions\\.com
+dotomi\\.com
+pardot\\.com
+marketo\\.net
+rfksrv\\.com
+adnxs\\.com
+shartethis\\.com
+d31qbv1cthcecs
+douyfz3utcehi
+scorecardresearch\\.com
+nonembed\\.com
+peer39\\.com
+d3p2jlw8pmhccg
+dnkzzz1hlto79
+zqtk\\.net
+cloudinary\\.com
+omtrdc\\.net
+d5nxst8fruw4z
+d1p6rqiydn62x8
+dmtracker\\.com
+dp8hsntg6do36
+buysellads\\.com
+intercomcdn\\.net
+dpstvy7p9whsy
+cpx\\.to
+b-cdn\\.net
+googlecommerce\\.com
+insightexpressai\\.com
+evidon\\.com
+footprint\\.net
+advertising\\.com
+specificmedia\\.com
+quantcount\\.com
+amgdgt\\.com
+bluekai\\.com
+smartclip\\.net
+azureedge\\.net
+iesnare\\.com
+medscape\\.com
+agkn\\.com
+cliipa\\.com
+digiday\\.com
+convertro\\.com
+linksynergy\\.com
+woobi\\.com
+adx1\\.com
+254a\\.com
+mediaforge\\.com
+videostat\\.net
+theadtech\\.com
+emxdgt\\.com
+acuityplatform\\.com
+header\\.direct'''
+
+badregex_regex_filters = '\n'.join(x for x in badregex_regex_filters.split('\n') if not bool(re.search(r'^\s*?(?:#|$)',x)))
+badregex_regex_filters_re = re.compile(r'(?:{})'.format('|'.join(badregex_regex_filters.split('\n'))),re.IGNORECASE)
+
+if __name__ == "__main__":
+    res = EasyListPAC()
+
+sys.exit()
