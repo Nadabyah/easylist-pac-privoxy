@@ -119,12 +119,11 @@ class EasyListPAC:
         return self.args
 
     def easylists_download_latest(self):
-        iOSAdblockList = 'https://raw.githubusercontent.com/BlackJack8/iOSAdblockList/master/Hosts.txt'
         easylist_url = 'https://easylist.to/easylist/easylist.txt'
         easyprivacy_url = 'https://easylist.to/easylist/easyprivacy.txt'
         fanboy_annoyance_url = 'https://easylist.to/easylist/fanboy-annoyance.txt'
         fanboy_antifacebook = 'https://raw.githubusercontent.com/ryanbr/fanboy-adblock/master/fanboy-antifacebook.txt'
-        self.download_list = [iOSAdblockList, fanboy_antifacebook, fanboy_annoyance_url, easyprivacy_url, easylist_url] + self.extra_easylist_urls
+        self.download_list = [fanboy_antifacebook, fanboy_annoyance_url, easyprivacy_url, easylist_url] + self.extra_easylist_urls
         self.file_list = []
         for url in self.download_list:
             fname = os.path.basename(url)
