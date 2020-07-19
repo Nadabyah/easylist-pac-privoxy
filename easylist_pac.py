@@ -1707,8 +1707,12 @@ commentname_sections_ignore_re = r'(?:{})'.format('|'.join(re.sub(r'([.])','\\.'
 gizmodo.in
 shink.in
 project-free-tv.li
+vshare.eu
 pencurimovie.ph
 filmlinks4u.is
+Spiegel.de
+bento.de
+German
 French
 Arabic
 Armenian
@@ -1718,9 +1722,11 @@ Chinese
 Croatian
 Czech
 Danish
+Dutch
 Estonian
 Finnish
 Georgian
+Greek
 Hebrew
 Hungarian
 Icelandic
@@ -1736,6 +1742,7 @@ Persian
 Polish
 Portuguese
 Romanian
+Russian
 Serbian
 Singaporean
 Slovene
@@ -1744,7 +1751,18 @@ Spanish
 Swedish
 Thai
 Turkish
+Ukranian
+Ukrainian
 Vietnamese
+Gamestar.de
+Focus.de
+tvspielfilm.de
+Prosieben
+Wetter.com
+Woxikon.de
+Fanfiktion.de
+boote-forum.de
+comunio.de
 planetsnow.de'''.split('\n')))
 
 # include these rules, no matter their priority
